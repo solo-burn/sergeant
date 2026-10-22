@@ -2,8 +2,87 @@ package parser
 
 import (
 	"errors"
+	"slices"
 	"testing"
 )
+
+func TestParseMessage(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want []Command
+	}{
+		{
+			name: "one adjustment per line",
+			text: "<@U1> +39\n<@U2> +41\n<@U3> +43",
+			want: []Command{
+				{Kind: KindAdd, Target: "U1", Sign: 1, Minor: 3900},
+				{Kind: KindAdd, Target: "U2", Sign: 1, Minor: 4100},
+				{Kind: KindAdd, Target: "U3", Sign: 1, Minor: 4300},
+			},
+		},
+		{
+			name: "blank lines and CRLF around signed amounts and currencies",
+			text: "\r\n <@U1|user> -2,50 EUR\r\n \r\n <@U2> 3 GBP \r\n",
+			want: []Command{
+				{Kind: KindAdd, Target: "U1", Sign: -1, Minor: 250, Currency: "EUR"},
+				{Kind: KindAdd, Target: "U2", Sign: 1, Minor: 300, Currency: "GBP"},
+			},
+		},
+		{
+			name: "single query remains supported",
+			text: "status",
+			want: []Command{{Kind: KindStatusAll}},
+		},
+		{
+			name: "multiline payment value remains a single command",
+			text: "pay set bank PL61\n1090 0000",
+			want: []Command{{Kind: KindPaySet, PayMethod: "bank", PayValue: "PL61 1090 0000"}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
+			text := tc.text
+
+			// Act
+			got, err := ParseMessage(text)
+
+			// Assert
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("got %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseMessageRejectsInvalidBatch(t *testing.T) {
+	tests := []struct{ name, text string }{
+		{name: "empty message", text: "\n \n"},
+		{name: "invalid later amount", text: "<@U1> +39\n<@U2> +oops"},
+		{name: "invalid later currency", text: "<@U1> +39\n<@U2> +41 PLNS"},
+		{name: "query mixed with adjustment", text: "<@U1> +39\nstatus"},
+		{name: "reset mixed with adjustment", text: "<@U1> +39\n<@U2> reset"},
+		{name: "multiple entries on one line", text: "<@U1> +39 <@U2> +41"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
+			text := tc.text
+
+			// Act
+			got, err := ParseMessage(text)
+
+			// Assert
+			if !errors.Is(err, ErrUnrecognized) || len(got) != 0 {
+				t.Fatalf("got %+v, %v; want no commands and ErrUnrecognized", got, err)
+			}
+		})
+	}
+}
 
 func TestParse(t *testing.T) {
 	tests := []struct {

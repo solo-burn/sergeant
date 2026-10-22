@@ -29,7 +29,16 @@ A Slack bot that tracks who owes you money.
 @sergeant hello            posts the help message to the channel
 ```
 
-Every successful command gets a `:white_check_mark:` reaction. Debt changes use reactions only, including in DMs: `:sergeant:` plus `:white_check_mark:` on success and `:sergeant-no:` on failure. Status and pay replies are private to you.
+To adjust several people's tabs in one message, put each person and amount on a separate line:
+
+```
+@sergeant
+@user1 +39
+@user2 +41
+@user3 +43
+```
+
+Every successful command gets a `:white_check_mark:` reaction. Successful debt changes use reactions only, including in DMs: `:sergeant:` plus `:white_check_mark:`. Failures get `:sergeant-no:`, with the failure list for multiline updates described above. Status and pay replies are private to you.
 
 You can also DM the bot directly - drop the `@sergeant` prefix and just type the command (e.g. `@jan +20 PLN`).
 

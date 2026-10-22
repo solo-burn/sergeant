@@ -46,6 +46,28 @@ var (
 	amountRE  = regexp.MustCompile(`^([+-]?)(\d+)(?:[.,](\d{1,2}))?$`)
 )
 
+// ParseMessage accepts a single command or one debt adjustment per non-empty line.
+func ParseMessage(text string) ([]Command, error) {
+	if cmd, err := Parse(text); err == nil {
+		return []Command{cmd}, nil
+	}
+	var commands []Command
+	for line := range strings.SplitSeq(text, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		cmd, err := Parse(line)
+		if err != nil || cmd.Kind != KindAdd {
+			return nil, ErrUnrecognized
+		}
+		commands = append(commands, cmd)
+	}
+	if len(commands) == 0 {
+		return nil, ErrUnrecognized
+	}
+	return commands, nil
+}
+
 func Parse(text string) (Command, error) {
 	text = strings.TrimSpace(text)
 	if text == "?" || strings.EqualFold(text, "status") {

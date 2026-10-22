@@ -375,6 +375,139 @@ func TestAppMentionDebtMutationDoesNotReplyWhenReactionFails(t *testing.T) {
 	}
 }
 
+func TestMultilineDebtMessageUpdatesEveryPerson(t *testing.T) {
+	for _, source := range []struct {
+		name    string
+		message func(string) []byte
+		prefix  string
+	}{
+		{name: "channel mention", message: appMention, prefix: "<@USERGEANT>\n"},
+		{name: "direct message", message: directMessage},
+	} {
+		t.Run(source.name, func(t *testing.T) {
+			// Arrange
+			h, sp, l := newHandler(t)
+			event := parseCallbackEvent(t, source.message(source.prefix+"<@UBBB> +39\n<@UCCC> +41\n<@UDDD> +43"))
+			wantStatuses := map[string]string{
+				"UBBB": "<@UBBB> owes you 39.00 PLN.",
+				"UCCC": "<@UCCC> owes you 41.00 PLN.",
+				"UDDD": "<@UDDD> owes you 43.00 PLN.",
+			}
+
+			// Act
+			h.dispatch(event)
+
+			// Assert
+			for target, want := range wantStatuses {
+				r, err := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: target})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if r.Text != want {
+					t.Errorf("ledger view: got %q, want %q", r.Text, want)
+				}
+			}
+			if len(sp.calls) != 0 {
+				t.Errorf("debt message should not post a reply, got %v", sp.calls)
+			}
+			if len(sp.reactions) != 2 || sp.reactions[0].name != mentionEmoji || sp.reactions[1].name != successEmoji {
+				t.Errorf("reactions = %v, want %q followed by %q", sp.reactions, mentionEmoji, successEmoji)
+			}
+		})
+	}
+}
+
+func TestMultilineDebtMessageListsFailuresAndContinues(t *testing.T) {
+	for _, tc := range []struct {
+		name, locale, prefix, wantText, wantTarget, wantChannel string
+		message                                                 func(string) []byte
+	}{
+		{
+			name: "channel", locale: "en", prefix: "<@USERGEANT>\n", message: appMention,
+			wantTarget: "123.456", wantChannel: "C1",
+			wantText: ":cop: These updates failed; all other updates were saved:\n- <@UAAA> (update 1)\n- <@UAAA> (update 3)",
+		},
+		{
+			name: "direct message", locale: "en", message: directMessage, wantTarget: "123.456", wantChannel: "D1",
+			wantText: ":cop: These updates failed; all other updates were saved:\n- <@UAAA> (update 1)\n- <@UAAA> (update 3)",
+		},
+		{
+			name: "Polish channel", locale: "pl", prefix: "<@USERGEANT>\n", message: appMention,
+			wantTarget: "123.456", wantChannel: "C1",
+			wantText: ":cop: Te zmiany się nie powiodły; wszystkie pozostałe zostały zapisane:\n- <@UAAA> (zmiana 1)\n- <@UAAA> (zmiana 3)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
+			h, sp, l := newHandler(t)
+			h.Translator = i18n.New(tc.locale)
+			event := parseCallbackEvent(t, tc.message(tc.prefix+"<@UAAA> +1\n<@UBBB> +39\n<@UAAA> +2\n<@UCCC> +41"))
+			wantStatuses := map[string]string{
+				"UBBB": "<@UBBB> owes you 39.00 PLN.",
+				"UCCC": "<@UCCC> owes you 41.00 PLN.",
+			}
+
+			// Act
+			h.dispatch(event)
+
+			// Assert
+			for target, want := range wantStatuses {
+				r, err := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: target})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if r.Text != want {
+					t.Errorf("ledger view: got %q, want %q", r.Text, want)
+				}
+			}
+			if len(sp.calls) != 1 {
+				t.Fatalf("got %v replies, want one failure list", sp.calls)
+			}
+			if got := sp.calls[0]; got.text != tc.wantText || got.ephemeral || got.target != tc.wantTarget || got.channel != tc.wantChannel {
+				t.Errorf("unexpected failure reply: %+v", got)
+			}
+			if len(sp.reactions) != 1 || sp.reactions[0].name != unrecognizedCommandEmoji {
+				t.Errorf("reactions = %v, want only %q", sp.reactions, unrecognizedCommandEmoji)
+			}
+		})
+	}
+}
+
+func TestMultilineDebtMessageReportsInvalidEntry(t *testing.T) {
+	for _, tc := range []struct{ name, lastLine, wantStatus string }{
+		{name: "malformed amount", lastLine: "<@UCCC> +oops", wantStatus: "<@UBBB> owes you nothing."},
+		{name: "self target after successful adjustment", lastLine: "<@UAAA> +41", wantStatus: "<@UBBB> owes you 39.00 PLN."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
+			h, sp, l := newHandler(t)
+			event := parseCallbackEvent(t, appMention("<@USERGEANT>\n<@UBBB> +39\n"+tc.lastLine))
+
+			// Act
+			h.dispatch(event)
+
+			// Assert
+			r, err := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: "UBBB"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.Text != tc.wantStatus {
+				t.Fatalf("ledger view: got %q, want %q", r.Text, tc.wantStatus)
+			}
+			var foundError bool
+			for _, reaction := range sp.reactions {
+				if reaction.name == successEmoji {
+					t.Error("invalid batch must not get a success reaction")
+				}
+				foundError = foundError || reaction.name == unrecognizedCommandEmoji
+			}
+			if !foundError {
+				t.Error("invalid batch must get an error reaction")
+			}
+		})
+	}
+}
+
 func TestFailedDebtMutationUsesErrorReactionOnly(t *testing.T) {
 	tests := []struct {
 		name  string

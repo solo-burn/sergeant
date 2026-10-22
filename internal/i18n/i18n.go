@@ -51,9 +51,11 @@ const (
 	PayOptPaypal    = "pay.option_paypal"
 	PayOptWise      = "pay.option_wise"
 
-	HandlerUsage      = "handler.usage"
-	HandlerSelfTarget = "handler.self_target"
-	HandlerError      = "handler.error"
+	HandlerUsage         = "handler.usage"
+	HandlerSelfTarget    = "handler.self_target"
+	HandlerError         = "handler.error"
+	HandlerFailedUpdates = "handler.failed_updates" // args: failed update list
+	HandlerFailedUpdate  = "handler.failed_update"  // args: target, update number
 )
 
 var bundles = map[string]map[string]string{
@@ -104,6 +106,7 @@ var bundles = map[string]map[string]string{
 			"- `@sergeant <@user> +AMOUNT [CCY]` - add to their tab\n" +
 			"- `@sergeant <@user> AMOUNT [CCY]` - plus is optional!\n" +
 			"- `@sergeant <@user> -AMOUNT [CCY]` - subtract from their tab\n" +
+			"- Adjust several tabs in one message: mention `@sergeant` once, then put each `<@user> AMOUNT [CCY]` on a separate line\n" +
 			"- `@sergeant <@user> reset [CCY]` - clear their tab (one currency or all)\n" +
 			"- `@sergeant <@user> status` (or `?`) - what they owe you\n" +
 			"- `@sergeant status` (or `?`) - everything you owe and are owed\n" +
@@ -118,8 +121,10 @@ var bundles = map[string]map[string]string{
 			"- `@sergeant <@user> pay` - show someone else's methods\n\n" +
 			"*Other*\n" +
 			"- `@sergeant help` - ??? you are already seeing it!",
-		HandlerSelfTarget: "You can't owe yourself.",
-		HandlerError:      "Something went wrong.",
+		HandlerSelfTarget:    "You can't owe yourself.",
+		HandlerError:         "Something went wrong.",
+		HandlerFailedUpdates: "These updates failed; all other updates were saved:\n%s",
+		HandlerFailedUpdate:  "- <@%s> (update %d)",
 	},
 	"pl": {
 		LedgerNowOwes:             "<@%s> jest tobie winny %s %s.",
@@ -168,6 +173,7 @@ var bundles = map[string]map[string]string{
 			"- `@sergeant <@user> +KWOTA [WALUTA]` - dolicz do jego rachunku\n" +
 			"- `@sergeant <@user> KWOTA [WALUTA]` - plus jest opcjonalny!\n" +
 			"- `@sergeant <@user> -KWOTA [WALUTA]` - odejmij od jego rachunku\n" +
+			"- Zmień kilka długów na raz: oznacz `@sergeant`, a każdy wpis `<@user> KWOTA [WALUTA]` umieść w osobnym wierszu\n" +
 			"- `@sergeant <@user> reset [WALUTA]` - wyzeruj rachunek (jedna waluta lub wszystko)\n" +
 			"- `@sergeant <@user> status` (lub `?`) - ile jest ci winny\n" +
 			"- `@sergeant status` (lub `?`) - wszystko, co jesteś winny i co tobie są winni\n" +
@@ -182,8 +188,10 @@ var bundles = map[string]map[string]string{
 			"- `@sergeant <@user> pay` - pokaż metody innej osoby\n\n" +
 			"*Pozostałe*\n" +
 			"- `@sergeant help` - ??? to co wlasnie widzisz!",
-		HandlerSelfTarget: "Nie możesz zapisać długu na samego siebie.",
-		HandlerError:      "Coś poszło nie tak.",
+		HandlerSelfTarget:    "Nie możesz zapisać długu na samego siebie.",
+		HandlerError:         "Coś poszło nie tak.",
+		HandlerFailedUpdates: "Te zmiany się nie powiodły; wszystkie pozostałe zostały zapisane:\n%s",
+		HandlerFailedUpdate:  "- <@%s> (zmiana %d)",
 	},
 }
 

@@ -186,7 +186,7 @@ func (h *Handler) dispatch(event slackevents.EventsAPIEvent) {
 		"text", stripped,
 	)
 
-	cmd, err := parser.Parse(stripped)
+	commands, err := parser.ParseMessage(stripped)
 	if err != nil {
 		h.Logger.Info("unrecognized command", "text", stripped)
 		acknowledge(false)
@@ -194,6 +194,35 @@ func (h *Handler) dispatch(event slackevents.EventsAPIEvent) {
 		h.send(ctx, Reply{channel: msg.channel, user: msg.user, text: h.Translator.T(i18n.HandlerUsage), ephemeral: true})
 		return
 	}
+	if len(commands) > 1 {
+		var failures []string
+		for i, cmd := range commands {
+			if _, err := h.Ledger.Apply(ctx, msg.user, cmd); err != nil {
+				h.Logger.Error("ledger apply", "target", cmd.Target, "err", err)
+				failures = append(failures, h.Translator.T(i18n.HandlerFailedUpdate, cmd.Target, i+1))
+			}
+		}
+		if len(failures) > 0 {
+			// Report failures even if processing exhausted the original timeout.
+			reportCtx, reportCancel := context.WithTimeout(context.Background(), replyTimeout)
+			defer reportCancel()
+			if err := h.Responder.AddReaction(reportCtx, msg.channel, msg.ts, unrecognizedCommandEmoji); err != nil {
+				h.Logger.Warn("add failed debt mutation reaction", "err", err)
+			}
+			threadTs := msg.threadTs
+			if threadTs == "" {
+				threadTs = msg.ts
+			}
+			h.send(reportCtx, Reply{
+				channel: msg.channel, user: msg.user, threadTs: threadTs,
+				text: h.Translator.T(i18n.HandlerFailedUpdates, strings.Join(failures, "\n")),
+			})
+			return
+		}
+		markSuccess(true)
+		return
+	}
+	cmd := commands[0]
 	h.Logger.Info("dispatch", "kind", cmd.Kind, "target", cmd.Target)
 	debtMutation := cmd.Kind == parser.KindAdd || cmd.Kind == parser.KindReset
 
