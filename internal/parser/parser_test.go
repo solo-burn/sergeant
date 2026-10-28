@@ -84,6 +84,44 @@ func TestParseMessageRejectsInvalidBatch(t *testing.T) {
 	}
 }
 
+func TestParsePayme(t *testing.T) {
+	// Arrange
+	tests := []struct {
+		name string
+		text string
+		bad  bool
+	}{
+		{name: "shows own payment methods", text: "payme"},
+		{name: "ignores case", text: "PaYmE"},
+		{name: "trims surrounding whitespace", text: " \tpayme\n "},
+		{name: "rejects extra arguments", text: "payme extra", bad: true},
+		{name: "rejects a target mention", text: "<@U1> payme", bad: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
+			want := Command{Kind: KindPayShowSelf}
+
+			// Act
+			got, err := Parse(tc.text)
+
+			// Assert
+			if tc.bad {
+				if !errors.Is(err, ErrUnrecognized) {
+					t.Fatalf("want ErrUnrecognized, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != want {
+				t.Fatalf("got %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
 func TestParse(t *testing.T) {
 	tests := []struct {
 		in   string

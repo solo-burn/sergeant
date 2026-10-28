@@ -20,7 +20,7 @@ A Slack bot that tracks who owes you money.
 @sergeant pay set          opens a private form to add a payment method
 @sergeant pay set bank PL61 1090 ...   same, but typed inline
 @sergeant pay set-default bank         marks a saved method as your default
-@sergeant pay me           shows your own payment methods
+@sergeant pay me           shows your own payment methods (or @sergeant payme)
 @sergeant @jan pay         shows jan's payment methods
 @sergeant pay rm bank      removes one method
 @sergeant pay clear        wipes all your methods

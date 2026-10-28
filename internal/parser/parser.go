@@ -82,6 +82,9 @@ func Parse(text string) (Command, error) {
 	if strings.EqualFold(text, "hello") {
 		return Command{Kind: KindHello}, nil
 	}
+	if strings.EqualFold(text, "payme") {
+		return Command{Kind: KindPayShowSelf}, nil
+	}
 
 	// Pay commands without a leading user mention: pay / pay set / pay rm / pay clear.
 	if fields := strings.Fields(text); len(fields) > 0 && strings.EqualFold(fields[0], "pay") {
