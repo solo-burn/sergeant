@@ -20,3 +20,6 @@ jobs:
 
       - name: Check
         run: make check
+
+      - name: Fuzz debt accounting
+        run: make fuzz-ledger

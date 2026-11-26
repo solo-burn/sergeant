@@ -97,13 +97,28 @@ func migrate(db *sql.DB, migrations []string) error {
 	if err := ScanRow(ctx, tx, sqlite.RawStatement("PRAGMA user_version"), &version); err != nil {
 		return err
 	}
-	if version < 0 || version > schema.JournalVersion {
-		return fmt.Errorf("unsupported database schema version %d (latest %d)", version, schema.JournalVersion)
+	unversioned := version == 0
+	if version < 0 || version > len(migrations) {
+		return fmt.Errorf("unsupported database schema version %d (latest %d)", version, len(migrations))
+	}
+	if unversioned || len(migrations) < schema.JournalVersion {
+		detected, err := inferSchemaVersion(ctx, tx)
+		if err != nil {
+			return err
+		}
+		// A primary writer would change debts without posting to the journal.
+		// Inspect the tables even when a restored file claims a legacy version.
+		if detected > len(migrations) {
+			return errors.New("cannot use a journal database as the primary balance database")
+		}
+		if unversioned {
+			version = detected
+		}
 	}
 	if err := dropComparisonColumns(ctx, tx); err != nil {
 		return err
 	}
-	if version >= len(migrations) {
+	if !unversioned && version == len(migrations) {
 		return tx.Commit()
 	}
 	if _, err := sqlite.RawStatement(schema.Bootstrap).Exec(tx); err != nil {
@@ -114,12 +129,6 @@ func migrate(db *sql.DB, migrations []string) error {
 		return fmt.Errorf("backfill legacy timestamps: %w", err)
 	}
 
-	if version == 0 {
-		version, err = inferSchemaVersion(ctx, tx)
-		if err != nil {
-			return err
-		}
-	}
 	for version < len(migrations) {
 		if _, err := sqlite.RawStatement(migrations[version]).Exec(tx); err != nil {
 			return fmt.Errorf("migration v%d: %w", version+1, err)

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1159,4 +1160,42 @@ func TestSlackUsesLegacyWhileGhostIsOffline(t *testing.T) {
 	if err != nil || !ok || first.Command.Target != "UBBB" || first.Command.Minor != 2000 {
 		t.Fatalf("queued first line %+v, err %v", first, err)
 	}
+}
+
+func TestBatchRetryPreservesLineOrderAtBalanceLimit(t *testing.T) {
+	// Arrange
+	path := filepath.Join(t.TempDir(), "retry.db")
+	h, _, accounts := newHandlerAt(t, path)
+	_, err := accounts.ApplyOnce(t.Context(), "opening", "UAAA", parser.Command{
+		Kind: parser.KindAdd, Target: "UBBB", Sign: 1, Minor: math.MaxInt64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`CREATE TRIGGER unavailable BEFORE INSERT ON debts
+		WHEN NEW.amount_minor = 9223372036854775806
+		BEGIN SELECT RAISE(ABORT, 'temporary write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	batch := parseCallbackEvent(t, appMention("<@USERGEANT> <@UBBB> -0.01\n<@UBBB> +0.01"))
+	if _, err := h.processEvent(t.Context(), batch); err == nil {
+		t.Fatal("expected first delivery to fail")
+	}
+	if _, err := db.Exec("DROP TRIGGER unavailable"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Act
+	_, err = h.processEvent(t.Context(), batch)
+
+	// Assert
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPairStatus(t, accounts, "UBBB", "<@UBBB> owes you 92233720368547758.07 PLN.")
 }

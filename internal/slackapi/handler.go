@@ -276,7 +276,7 @@ func (h *Handler) applyDebtChanges(
 	ctx context.Context, notice *feedback, receiptPrefix string, commands []parser.Command,
 ) error {
 	var failedUpdates []string
-	var retryErr error
+	notice.acknowledge = true
 	for index, cmd := range commands {
 		// Preserve the zero-based position in the receipt even when two lines are identical.
 		receiptID := receiptPrefix + "/" + strconv.Itoa(index)
@@ -285,22 +285,22 @@ func (h *Handler) applyDebtChanges(
 			continue
 		}
 		h.Logger.Error("apply account command", "kind", cmd.Kind, "target", cmd.Target, "err", err)
-		failedUpdates = append(failedUpdates, h.Translator.T(i18n.HandlerFailedUpdate, cmd.Target, index+1))
-		if !errors.Is(err, engine.ErrSelfTarget) && !errors.Is(err, engine.ErrBalanceOverflow) {
-			retryErr = err
+		notice.failed = true
+		notice.acknowledge = false
+		if errors.Is(err, engine.ErrSelfTarget) || errors.Is(err, engine.ErrBalanceOverflow) {
+			failedUpdates = append(failedUpdates, h.Translator.T(i18n.HandlerFailedUpdate, cmd.Target, index+1))
+			continue
 		}
-	}
 
-	if len(failedUpdates) == 0 {
-		notice.acknowledge = true
-		return nil
+		if len(commands) > 1 {
+			notice.text = h.Translator.T(i18n.HandlerError)
+		}
+		return err
 	}
-	notice.acknowledge = false
-	notice.failed = true
-	if len(commands) > 1 {
+	if len(failedUpdates) > 0 && len(commands) > 1 {
 		notice.text = h.Translator.T(i18n.HandlerFailedUpdates, strings.Join(failedUpdates, "\n"))
 	}
-	return retryErr
+	return nil
 }
 
 func (h *Handler) deliver(notice *feedback) {

@@ -474,3 +474,75 @@ func TestLedgerPanicLeavesCommandQueued(t *testing.T) {
 		t.Fatalf("queued command %+v, err %v", d, err)
 	}
 }
+
+func TestRestoredTrialReplaysPendingDebtExactlyOnce(t *testing.T) {
+	// Arrange
+	source := newTrial(t)
+	source.apply(t, "already-posted", charge(500))
+	if err := source.drain(t.Context(), source.ledger(t)); err != nil {
+		t.Fatal(err)
+	}
+	source.apply(t, "pending", charge(200))
+	// Both writers are idle while SQLite takes these two snapshots.
+	dir := t.TempDir()
+	primary, journal := filepath.Join(dir, "primary.db"), filepath.Join(dir, "journal.db")
+	for _, backup := range []struct{ from, to string }{{source.primary, primary}, {source.ghost, journal}} {
+		if _, err := connect(t, backup.from).Exec("VACUUM INTO ?", backup.to); err != nil {
+			t.Fatal(err)
+		}
+	}
+	restored := openTrial(t, primary, journal)
+
+	// Act
+	restored.apply(t, "pending", charge(200))
+	err := restored.drain(t.Context(), restored.ledger(t))
+
+	// Assert
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertReplaySequence(t, journal, 2)
+	want := balances{tab{"A", "B", "PLN"}: 700}
+	assertAmounts(t, "restored primary", want, connect(t, primary), selectDebts)
+	db := connect(t, journal)
+	assertAmounts(t, "restored journal", want, db, selectDebts)
+	var entries, receipts int
+	err = db.QueryRow("SELECT (SELECT count(*) FROM ledger_entries), count(*) FROM applied_commands").Scan(&entries, &receipts)
+	if err != nil || entries != 2 || receipts != 2 {
+		t.Fatalf("restored entries=%d receipts=%d: %v", entries, receipts, err)
+	}
+}
+
+func TestLegacyRejectsJournalAsPrimary(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version int
+	}{
+		{"versioned journal", schema.JournalVersion},
+		{"journal restored from a dump", 0},
+		{"journal with stale balance schema version", len(schema.BalanceMigrations)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
+			dir := t.TempDir()
+			path := filepath.Join(dir, "existing-journal.db")
+			db, err := database.OpenBalances(path, schema.Ledger)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			if _, err := db.Exec("PRAGMA user_version = " + strconv.Itoa(tc.version)); err != nil {
+				t.Fatal(err)
+			}
+
+			// Act
+			trial, err := Open(t.Context(), path, filepath.Join(dir, "replica.db"), "PLN", i18n.New("en"))
+
+			// Assert
+			if err == nil {
+				t.Cleanup(func() { _ = trial.Legacy.Close() })
+				t.Fatal("accepted a journal as the primary balance writer")
+			}
+		})
+	}
+}

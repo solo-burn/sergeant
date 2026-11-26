@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"database/sql"
+	_ "embed"
 	"errors"
 	"math"
 	"path/filepath"
@@ -785,6 +786,9 @@ func TestRedeliveredResetPreservesJournal(t *testing.T) {
 	}
 }
 
+//go:embed reconcile.sql
+var reconcileSQL string
+
 func TestAccountPostingsReconstructCurrentBalances(t *testing.T) {
 	// Arrange
 	l, db := ledgerWithJournal(t)
@@ -796,22 +800,39 @@ func TestAccountPostingsReconstructCurrentBalances(t *testing.T) {
 
 	// Act
 	var differences int
-	row := db.QueryRow(`
-		WITH reconstructed AS (
-			SELECT account_id, counterparty_id, currency,
-			       SUM(amount_minor ORDER BY entry_id) AS balance
-			FROM account_postings
-			GROUP BY account_id, counterparty_id, currency
-			HAVING balance > 0
-		), current AS (
-			SELECT creditor_id, debtor_id, currency, amount_minor FROM debts
-		)
-		SELECT (SELECT count(*) FROM (SELECT * FROM reconstructed EXCEPT SELECT * FROM current))
-		     + (SELECT count(*) FROM (SELECT * FROM current EXCEPT SELECT * FROM reconstructed))`)
+	row := db.QueryRow(reconcileSQL)
 	err := row.Scan(&differences)
 
 	// Assert
 	if err != nil || differences != 0 {
 		t.Fatalf("reconstructed and stored balances differ by %d rows: %v", differences, err)
+	}
+}
+
+func TestReconciliationDetectsBalanceDrift(t *testing.T) {
+	for _, tc := range []struct {
+		name, change string
+	}{
+		{"missing debt", "DELETE FROM debts"},
+		{"incorrect amount", "UPDATE debts SET amount_minor = amount_minor + 1"},
+		{"additional debt", "INSERT INTO debts VALUES ('C','D','EUR',1,1,1)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
+			l, db := ledgerWithJournal(t)
+			add(t, l, "A", "B", 1, 100, "PLN")
+			if _, err := db.Exec(tc.change); err != nil {
+				t.Fatal(err)
+			}
+
+			// Act
+			var differences int
+			err := db.QueryRow(reconcileSQL).Scan(&differences)
+
+			// Assert
+			if err != nil || differences == 0 {
+				t.Fatalf("reconciliation reported %d differences: %v", differences, err)
+			}
+		})
 	}
 }

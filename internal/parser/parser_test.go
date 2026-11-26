@@ -2,6 +2,7 @@ package parser
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"slices"
 	"testing"
@@ -249,4 +250,39 @@ func TestParse(t *testing.T) {
 			}
 		})
 	}
+}
+
+func FuzzDecimalAdjustment(f *testing.F) {
+	for _, cents := range []uint64{0, 1, 10, 100, math.MaxInt64, math.MaxInt64 + 1, math.MaxUint64} {
+		f.Add(cents, false, false)
+		f.Add(cents, true, true)
+	}
+	f.Fuzz(func(t *testing.T, cents uint64, negative, comma bool) {
+		// Arrange
+		sign, prefix := 1, "+"
+		if negative {
+			sign, prefix = -1, "-"
+		}
+		separator := "."
+		if comma {
+			separator = ","
+		}
+		text := fmt.Sprintf("<@B> %s%d%s%02d EUR", prefix, cents/100, separator, cents%100)
+		want := Command{Kind: KindAdd, Target: "B", Sign: sign, Currency: "EUR"}
+
+		// Act
+		got, err := Parse(text)
+
+		// Assert
+		if cents > math.MaxInt64 {
+			if !errors.Is(err, ErrUnrecognized) {
+				t.Fatalf("out-of-range %q: got %+v, %v", text, got, err)
+			}
+			return
+		}
+		want.Minor = int64(cents)
+		if err != nil || got != want {
+			t.Fatalf("input %q: got %+v, %v, want %+v", text, got, err, want)
+		}
+	})
 }
