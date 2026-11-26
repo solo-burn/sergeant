@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -24,9 +26,9 @@ import (
 	"github.com/slack-go/slack/slackevents"
 
 	"sergeant/internal/i18n"
-	"sergeant/internal/ledger"
+	"sergeant/internal/legacy"
 	"sergeant/internal/parser"
-	"sergeant/internal/store"
+	"sergeant/internal/shadow"
 )
 
 const (
@@ -96,42 +98,54 @@ func (s *spy) wait(t *testing.T) post {
 	return s.calls[len(s.calls)-1]
 }
 
-func newHandler(t *testing.T) (*Handler, *spy, *ledger.Ledger) {
+// dispatch delivers synchronously so tests can inspect reactions and replies.
+func dispatch(t *testing.T, h *Handler, event slackevents.EventsAPIEvent) {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "h.db"))
+	notice, err := h.processEvent(t.Context(), event)
+	if err != nil {
+		t.Fatalf("process event: %v", err)
+	}
+	if notice != nil {
+		h.deliver(notice)
+	}
+}
+
+func newHandler(t *testing.T) (*Handler, *spy, *legacy.Engine) {
+	t.Helper()
+	return newHandlerAt(t, filepath.Join(t.TempDir(), "legacy.db"))
+}
+
+func newHandlerAt(t *testing.T, primaryPath string) (*Handler, *spy, *legacy.Engine) {
+	t.Helper()
+	tr := i18n.New("en")
+	ledgerPath := filepath.Join(filepath.Dir(primaryPath), "ledger.db")
+	trial, err := shadow.Open(t.Context(), primaryPath, ledgerPath, "PLN", tr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = st.Close() })
-	tr := i18n.New("en")
-	led := ledger.New(st, "PLN", tr)
+	t.Cleanup(func() { _ = trial.Legacy.Close() })
 	sp := newSpy()
 	h := &Handler{
 		SigningSecret: testSecret,
 		BotUserID:     botID,
-		Ledger:        led,
+		Engine:        trial.Legacy,
 		Responder:     sp,
 		Translator:    tr,
 		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	return h, sp, led
+	t.Cleanup(h.Wait)
+	return h, sp, trial.Legacy
 }
 
-func waitForStatus(t *testing.T, l *ledger.Ledger, want string) {
+func assertPairStatus(t *testing.T, accounts *legacy.Engine, target, want string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		r, err := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: "UBBB"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if r.Text == want {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for status %q; last status was %q", want, r.Text)
-		}
-		time.Sleep(10 * time.Millisecond)
+	cmd := parser.Command{Kind: parser.KindStatusFor, Target: target}
+	reply, err := accounts.ApplyOnce(t.Context(), "", "UAAA", cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.Text != want {
+		t.Fatalf("status for %s = %q, want %q", target, reply.Text, want)
 	}
 }
 
@@ -205,6 +219,15 @@ func TestAppMentionDispatch(t *testing.T) {
 		target string
 	}{
 		{name: "status all", text: "<@USERGEANT> status", ephemeral: false, want: ":cop: Nobody owes you and you owe nothing.", target: "123.456"},
+		{
+			name: "empty pair status", text: "<@USERGEANT> <@UBBB> status", target: "123.456",
+			want: ":cop: <@UBBB> owes you nothing.",
+		},
+		{
+			name: "empty payment methods", text: "<@USERGEANT> pay me", target: "123.456",
+			want: ":cop: You haven't added any payment methods yet. Try " +
+				"`@sergeant pay set bank PL61 ...` or `@sergeant pay set blik 555 555 555`.",
+		},
 		{name: "unrecognized", text: "<@USERGEANT> ¿qué?", ephemeral: true, want: usageReply, target: "UAAA"},
 		{name: "bare mention", text: "<@USERGEANT>", ephemeral: true, want: usageReply, target: "UAAA"},
 		{name: "bad amount", text: "<@USERGEANT> <@UBBB> +abc", ephemeral: true, want: usageReply, target: "UAAA"},
@@ -236,7 +259,7 @@ func TestAppMentionDispatch(t *testing.T) {
 func TestAppMentionSuccessfulQueryAddsSuccessReactions(t *testing.T) {
 	h, sp, _ := newHandler(t)
 
-	h.dispatch(parseCallbackEvent(t, appMention("<@USERGEANT> status")))
+	dispatch(t, h, parseCallbackEvent(t, appMention("<@USERGEANT> status")))
 
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
@@ -265,7 +288,7 @@ func TestSuccessfulHandlerCommandsAddSuccessReactions(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h, sp, _ := newHandler(t)
 
-			h.dispatch(parseCallbackEvent(t, appMention(tc.command)))
+			dispatch(t, h, parseCallbackEvent(t, appMention(tc.command)))
 
 			sp.mu.Lock()
 			defer sp.mu.Unlock()
@@ -280,7 +303,7 @@ func TestFailedResponseDoesNotAddSuccessReaction(t *testing.T) {
 	h, sp, _ := newHandler(t)
 	sp.postErr = errors.New("post unavailable")
 
-	h.dispatch(parseCallbackEvent(t, appMention("<@USERGEANT> status")))
+	dispatch(t, h, parseCallbackEvent(t, appMention("<@USERGEANT> status")))
 
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
@@ -292,7 +315,7 @@ func TestFailedResponseDoesNotAddSuccessReaction(t *testing.T) {
 func TestDirectMessageDebtMutationUsesReactionOnly(t *testing.T) {
 	h, sp, l := newHandler(t)
 
-	h.dispatch(parseCallbackEvent(t, directMessage("<@UBBB> +20 PLN")))
+	dispatch(t, h, parseCallbackEvent(t, directMessage("<@UBBB> +20 PLN")))
 
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
@@ -302,12 +325,12 @@ func TestDirectMessageDebtMutationUsesReactionOnly(t *testing.T) {
 	if len(sp.calls) != 0 {
 		t.Fatalf("DM debt mutation should not post a message, got %v", sp.calls)
 	}
-	r, err := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: "UBBB"})
+	r, err := l.ApplyOnce(context.Background(), "", "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: "UBBB"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := "<@UBBB> owes you 20.00 PLN."; r.Text != want {
-		t.Fatalf("ledger view: got %q, want %q", r.Text, want)
+		t.Fatalf("account status: got %q, want %q", r.Text, want)
 	}
 }
 
@@ -327,14 +350,14 @@ func TestAppMentionDebtMutationsUseReactionOnly(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h, sp, l := newHandler(t)
 			if tc.initialMinor > 0 {
-				if _, err := l.Apply(context.Background(), "UAAA", parser.Command{
+				if _, err := l.ApplyOnce(context.Background(), "", "UAAA", parser.Command{
 					Kind: parser.KindAdd, Target: "UBBB", Sign: 1, Minor: tc.initialMinor, Currency: "PLN",
 				}); err != nil {
 					t.Fatal(err)
 				}
 			}
 
-			h.dispatch(parseCallbackEvent(t, appMention(tc.command)))
+			dispatch(t, h, parseCallbackEvent(t, appMention(tc.command)))
 
 			sp.mu.Lock()
 			defer sp.mu.Unlock()
@@ -344,12 +367,12 @@ func TestAppMentionDebtMutationsUseReactionOnly(t *testing.T) {
 			if len(sp.calls) != 0 {
 				t.Fatalf("debt mutation should not post a message, got %v", sp.calls)
 			}
-			r, err := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: "UBBB"})
+			r, err := l.ApplyOnce(context.Background(), "", "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: "UBBB"})
 			if err != nil {
 				t.Fatal(err)
 			}
 			if r.Text != tc.wantStatus {
-				t.Fatalf("ledger view: got %q, want %q", r.Text, tc.wantStatus)
+				t.Fatalf("account status: got %q, want %q", r.Text, tc.wantStatus)
 			}
 		})
 	}
@@ -359,19 +382,19 @@ func TestAppMentionDebtMutationDoesNotReplyWhenReactionFails(t *testing.T) {
 	h, sp, l := newHandler(t)
 	sp.reactionErr = errors.New("reaction unavailable")
 
-	h.dispatch(parseCallbackEvent(t, appMention("<@USERGEANT> <@UBBB> +20 PLN")))
+	dispatch(t, h, parseCallbackEvent(t, appMention("<@USERGEANT> <@UBBB> +20 PLN")))
 
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 	if len(sp.calls) != 0 {
 		t.Fatalf("debt mutation should remain silent when the reaction fails, got %v", sp.calls)
 	}
-	r, err := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: "UBBB"})
+	r, err := l.ApplyOnce(context.Background(), "", "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: "UBBB"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := "<@UBBB> owes you 20.00 PLN."; r.Text != want {
-		t.Fatalf("ledger view: got %q, want %q", r.Text, want)
+		t.Fatalf("account status: got %q, want %q", r.Text, want)
 	}
 }
 
@@ -395,16 +418,16 @@ func TestMultilineDebtMessageUpdatesEveryPerson(t *testing.T) {
 			}
 
 			// Act
-			h.dispatch(event)
+			dispatch(t, h, event)
 
 			// Assert
 			for target, want := range wantStatuses {
-				r, err := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: target})
+				r, err := l.ApplyOnce(context.Background(), "", "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: target})
 				if err != nil {
 					t.Fatal(err)
 				}
 				if r.Text != want {
-					t.Errorf("ledger view: got %q, want %q", r.Text, want)
+					t.Errorf("account status: got %q, want %q", r.Text, want)
 				}
 			}
 			if len(sp.calls) != 0 {
@@ -448,16 +471,16 @@ func TestMultilineDebtMessageListsFailuresAndContinues(t *testing.T) {
 			}
 
 			// Act
-			h.dispatch(event)
+			dispatch(t, h, event)
 
 			// Assert
 			for target, want := range wantStatuses {
-				r, err := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: target})
+				r, err := l.ApplyOnce(context.Background(), "", "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: target})
 				if err != nil {
 					t.Fatal(err)
 				}
 				if r.Text != want {
-					t.Errorf("ledger view: got %q, want %q", r.Text, want)
+					t.Errorf("account status: got %q, want %q", r.Text, want)
 				}
 			}
 			if len(sp.calls) != 1 {
@@ -466,8 +489,8 @@ func TestMultilineDebtMessageListsFailuresAndContinues(t *testing.T) {
 			if got := sp.calls[0]; got.text != tc.wantText || got.ephemeral || got.target != tc.wantTarget || got.channel != tc.wantChannel {
 				t.Errorf("unexpected failure reply: %+v", got)
 			}
-			if len(sp.reactions) != 1 || sp.reactions[0].name != unrecognizedCommandEmoji {
-				t.Errorf("reactions = %v, want only %q", sp.reactions, unrecognizedCommandEmoji)
+			if len(sp.reactions) != 1 || sp.reactions[0].name != failureEmoji {
+				t.Errorf("reactions = %v, want only %q", sp.reactions, failureEmoji)
 			}
 		})
 	}
@@ -484,22 +507,22 @@ func TestMultilineDebtMessageReportsInvalidEntry(t *testing.T) {
 			event := parseCallbackEvent(t, appMention("<@USERGEANT>\n<@UBBB> +39\n"+tc.lastLine))
 
 			// Act
-			h.dispatch(event)
+			dispatch(t, h, event)
 
 			// Assert
-			r, err := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: "UBBB"})
+			r, err := l.ApplyOnce(context.Background(), "", "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: "UBBB"})
 			if err != nil {
 				t.Fatal(err)
 			}
 			if r.Text != tc.wantStatus {
-				t.Fatalf("ledger view: got %q, want %q", r.Text, tc.wantStatus)
+				t.Fatalf("account status: got %q, want %q", r.Text, tc.wantStatus)
 			}
 			var foundError bool
 			for _, reaction := range sp.reactions {
 				if reaction.name == successEmoji {
 					t.Error("invalid batch must not get a success reaction")
 				}
-				foundError = foundError || reaction.name == unrecognizedCommandEmoji
+				foundError = foundError || reaction.name == failureEmoji
 			}
 			if !foundError {
 				t.Error("invalid batch must get an error reaction")
@@ -521,12 +544,12 @@ func TestFailedDebtMutationUsesErrorReactionOnly(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h, sp, _ := newHandler(t)
 
-			h.dispatch(parseCallbackEvent(t, tc.event))
+			dispatch(t, h, parseCallbackEvent(t, tc.event))
 
 			sp.mu.Lock()
 			defer sp.mu.Unlock()
-			if len(sp.reactions) != 1 || sp.reactions[0].name != unrecognizedCommandEmoji {
-				t.Fatalf("reactions = %v, want one %q reaction", sp.reactions, unrecognizedCommandEmoji)
+			if len(sp.reactions) != 1 || sp.reactions[0].name != failureEmoji {
+				t.Fatalf("reactions = %v, want one %q reaction", sp.reactions, failureEmoji)
 			}
 			if len(sp.calls) != 0 {
 				t.Fatalf("failed debt mutation should not post a message, got %v", sp.calls)
@@ -535,7 +558,6 @@ func TestFailedDebtMutationUsesErrorReactionOnly(t *testing.T) {
 	}
 }
 
-// signForm signs a form-urlencoded interactivity body the same way Slack does.
 func signForm(t *testing.T, body string, ts int64) *http.Request {
 	t.Helper()
 	mac := hmac.New(sha256.New, []byte(testSecret))
@@ -589,7 +611,6 @@ func TestBlockActionOpensModal(t *testing.T) {
 		t.Fatalf("got %d", rec.Code)
 	}
 
-	// The dispatch is in a goroutine; wait for OpenView.
 	select {
 	case <-sp.done:
 	case <-time.After(2 * time.Second):
@@ -629,7 +650,6 @@ func TestViewSubmissionStoresAndConfirms(t *testing.T) {
 		t.Fatalf("got %d (body=%s)", rec.Code, rec.Body.String())
 	}
 
-	// Confirmation arrives by updating the modal in-place.
 	var resp struct {
 		ResponseAction string `json:"response_action"`
 		View           struct {
@@ -654,13 +674,12 @@ func TestViewSubmissionStoresAndConfirms(t *testing.T) {
 		t.Errorf("update view body: got %q, want %q", resp.View.Blocks[0].Text.Text, want)
 	}
 
-	// Confirm the row was actually written.
-	pms, err := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindPayShowSelf})
+	pms, err := l.ApplyOnce(context.Background(), "", "UAAA", parser.Command{Kind: parser.KindPayShowSelf})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := "<@UAAA> :money_with_wings: \n- `bank` - PL61 1090 0000"; pms.Text != want {
-		t.Errorf("ledger view: got %q, want %q", pms.Text, want)
+		t.Errorf("account status: got %q, want %q", pms.Text, want)
 	}
 }
 
@@ -714,15 +733,15 @@ func TestAppMentionPaySetInline(t *testing.T) {
 	if want := ":cop: Saved your `bank`."; p.text != want {
 		t.Errorf("text: got %q, want %q", p.text, want)
 	}
-	r, _ := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindPayShowSelf})
+	r, _ := l.ApplyOnce(context.Background(), "", "UAAA", parser.Command{Kind: parser.KindPayShowSelf})
 	if want := "<@UAAA> :money_with_wings: \n- `bank` - PL61 1090 0000 1234"; r.Text != want {
-		t.Errorf("ledger view: got %q, want %q", r.Text, want)
+		t.Errorf("account status: got %q, want %q", r.Text, want)
 	}
 }
 
 func TestAppMentionPayRemove(t *testing.T) {
 	h, sp, l := newHandler(t)
-	if _, err := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindPaySet, PayMethod: "bank", PayValue: "PL61"}); err != nil {
+	if _, err := l.ApplyOnce(context.Background(), "", "UAAA", parser.Command{Kind: parser.KindPaySet, PayMethod: "bank", PayValue: "PL61"}); err != nil {
 		t.Fatal(err)
 	}
 	rec := httptest.NewRecorder()
@@ -731,7 +750,7 @@ func TestAppMentionPayRemove(t *testing.T) {
 		t.Fatalf("got %d", rec.Code)
 	}
 	sp.wait(t)
-	r, _ := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindPayShowSelf})
+	r, _ := l.ApplyOnce(context.Background(), "", "UAAA", parser.Command{Kind: parser.KindPayShowSelf})
 	want := "You haven't added any payment methods yet. Try `@sergeant pay set bank PL61 ...` or `@sergeant pay set blik 555 555 555`."
 	if r.Text != want {
 		t.Errorf("payment methods should be empty: got %q, want %q", r.Text, want)
@@ -741,7 +760,7 @@ func TestAppMentionPayRemove(t *testing.T) {
 func TestAppMentionPayClear(t *testing.T) {
 	h, sp, l := newHandler(t)
 	for _, m := range []string{"bank", "blik"} {
-		if _, err := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindPaySet, PayMethod: m, PayValue: "x"}); err != nil {
+		if _, err := l.ApplyOnce(context.Background(), "", "UAAA", parser.Command{Kind: parser.KindPaySet, PayMethod: m, PayValue: "x"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -751,7 +770,7 @@ func TestAppMentionPayClear(t *testing.T) {
 		t.Fatalf("got %d", rec.Code)
 	}
 	sp.wait(t)
-	r, _ := l.Apply(context.Background(), "UAAA", parser.Command{Kind: parser.KindPayShowSelf})
+	r, _ := l.ApplyOnce(context.Background(), "", "UAAA", parser.Command{Kind: parser.KindPayShowSelf})
 	want := "You haven't added any payment methods yet. Try `@sergeant pay set bank PL61 ...` or `@sergeant pay set blik 555 555 555`."
 	if r.Text != want {
 		t.Errorf("expected empty payment list: got %q, want %q", r.Text, want)
@@ -759,37 +778,47 @@ func TestAppMentionPayClear(t *testing.T) {
 }
 
 func TestAppMentionReset(t *testing.T) {
+	// Arrange
 	h, _, l := newHandler(t)
 	ctx := context.Background()
-	if _, err := l.Apply(ctx, "UAAA", parser.Command{Kind: parser.KindAdd, Target: "UBBB", Sign: 1, Minor: 2000, Currency: "PLN"}); err != nil {
+	if _, err := l.ApplyOnce(ctx, "", "UAAA", parser.Command{Kind: parser.KindAdd, Target: "UBBB", Sign: 1, Minor: 2000, Currency: "PLN"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := l.Apply(ctx, "UAAA", parser.Command{Kind: parser.KindAdd, Target: "UBBB", Sign: 1, Minor: 1000, Currency: "EUR"}); err != nil {
+	if _, err := l.ApplyOnce(ctx, "", "UAAA", parser.Command{Kind: parser.KindAdd, Target: "UBBB", Sign: 1, Minor: 1000, Currency: "EUR"}); err != nil {
 		t.Fatal(err)
 	}
 	rec := httptest.NewRecorder()
+
+	// Act
 	h.ServeHTTP(rec, sign(t, appMention("<@USERGEANT> <@UBBB> reset"), time.Now().Unix()))
+
+	// Assert
 	if rec.Code != http.StatusOK {
 		t.Fatalf("got %d", rec.Code)
 	}
-	waitForStatus(t, l, "<@UBBB> owes you nothing.")
+	assertPairStatus(t, l, "UBBB", "<@UBBB> owes you nothing.")
 }
 
 func TestAppMentionResetCurrency(t *testing.T) {
+	// Arrange
 	h, _, l := newHandler(t)
 	ctx := context.Background()
-	if _, err := l.Apply(ctx, "UAAA", parser.Command{Kind: parser.KindAdd, Target: "UBBB", Sign: 1, Minor: 2000, Currency: "PLN"}); err != nil {
+	if _, err := l.ApplyOnce(ctx, "", "UAAA", parser.Command{Kind: parser.KindAdd, Target: "UBBB", Sign: 1, Minor: 2000, Currency: "PLN"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := l.Apply(ctx, "UAAA", parser.Command{Kind: parser.KindAdd, Target: "UBBB", Sign: 1, Minor: 1000, Currency: "EUR"}); err != nil {
+	if _, err := l.ApplyOnce(ctx, "", "UAAA", parser.Command{Kind: parser.KindAdd, Target: "UBBB", Sign: 1, Minor: 1000, Currency: "EUR"}); err != nil {
 		t.Fatal(err)
 	}
 	rec := httptest.NewRecorder()
+
+	// Act
 	h.ServeHTTP(rec, sign(t, appMention("<@USERGEANT> <@UBBB> reset PLN"), time.Now().Unix()))
+
+	// Assert
 	if rec.Code != http.StatusOK {
 		t.Fatalf("got %d", rec.Code)
 	}
-	waitForStatus(t, l, "<@UBBB> owes you 10.00 EUR.")
+	assertPairStatus(t, l, "UBBB", "<@UBBB> owes you 10.00 EUR.")
 }
 
 func TestRejectsNonPost(t *testing.T) {
@@ -884,7 +913,7 @@ func directMessageWithBot(text string) []byte {
 func TestDirectMessageQueryDispatch(t *testing.T) {
 	h, sp, _ := newHandler(t)
 
-	h.dispatch(parseCallbackEvent(t, directMessage("status")))
+	dispatch(t, h, parseCallbackEvent(t, directMessage("status")))
 
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
@@ -939,5 +968,195 @@ func TestStripBotMention(t *testing.T) {
 		if got := stripBotMention(c.in, "USERGEANT"); got != c.want {
 			t.Errorf("strip(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+func TestRedeliveredBatchChargesEachLineOnce(t *testing.T) {
+	// Arrange
+	h, _, l := newHandler(t)
+	event := parseCallbackEvent(t, []byte(`{
+		"type": "event_callback",
+		"event_id": "Ev1",
+		"event": {
+			"type": "app_mention", "user": "UAAA", "channel": "C1", "ts": "123.456",
+			"text": "<@USERGEANT> <@UBBB> +20\n<@UBBB> +20"
+		}
+	}`))
+	dispatch(t, h, event)
+
+	// Act
+	dispatch(t, h, event)
+
+	// Assert
+	status, err := l.ApplyOnce(t.Context(), "", "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: "UBBB"})
+	if err != nil || status.Text != "<@UBBB> owes you 40.00 PLN." {
+		t.Fatalf("balance after redelivery: %+v, %v", status, err)
+	}
+}
+
+func TestBatchRetryAfterPartialDatabaseFailure(t *testing.T) {
+	// Arrange
+	path := filepath.Join(t.TempDir(), "partial.db")
+	h, _, accounts := newHandlerAt(t, path)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`CREATE TRIGGER unavailable BEFORE INSERT ON debts WHEN NEW.debtor_id='UCCC'
+		BEGIN SELECT RAISE(ABORT, 'temporary test failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	body := appMention("<@USERGEANT> <@UBBB> +20\n<@UCCC> +10")
+	send := func() int {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, sign(t, body, time.Now().Unix()))
+		return rec.Code
+	}
+	if code := send(); code != http.StatusServiceUnavailable {
+		t.Fatalf("partial delivery HTTP %d, want 503", code)
+	}
+	if _, err := db.Exec("DROP TRIGGER unavailable"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Act
+	code := send()
+
+	// Assert
+	if code != http.StatusOK {
+		t.Fatalf("redelivery HTTP %d", code)
+	}
+	status, err := accounts.ApplyOnce(t.Context(), "", "UAAA", parser.Command{Kind: parser.KindStatusAll})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "Owed to you:\n- <@UBBB> - 20.00 PLN\n- <@UCCC> - 10.00 PLN"
+	if status.Text != want {
+		t.Fatalf("balances after acknowledgement = %q, want %q", status.Text, want)
+	}
+}
+
+func TestEditedAndAutomatedMentionsLeaveBalancesAlone(t *testing.T) {
+	for _, tc := range []struct{ name, field string }{
+		{"edited original message", `"edited":{"user":"UAAA","ts":"123.999"}`},
+		{"another bot's mention", `"bot_id":"B123"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
+			h, _, l := newHandler(t)
+			body := fmt.Sprintf(`{
+				"type": "event_callback",
+				"event": {
+					"type": "app_mention", "user": "UAAA", "channel": "C1", "ts": "123.456",
+					"text": "<@USERGEANT> <@UBBB> +20", %s
+				}
+			}`, tc.field)
+			event := parseCallbackEvent(t, []byte(body))
+
+			// Act
+			dispatch(t, h, event)
+
+			// Assert
+			got, err := l.ApplyOnce(t.Context(), "", "UAAA", parser.Command{Kind: parser.KindStatusAll})
+			if err != nil || got.Text != "Nobody owes you and you owe nothing." {
+				t.Fatalf("status: %+v, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestPaymentFormKeepsDetailsOpenOnWriteFailure(t *testing.T) {
+	// Arrange
+	h, _, accounts := newHandler(t)
+	if err := accounts.Close(); err != nil {
+		t.Fatal(err)
+	}
+	values := map[string]map[string]slack.BlockAction{
+		blockMethod: {actionMethod: {SelectedOption: slack.OptionBlockObject{Value: "bank"}}},
+		blockValue:  {actionValue: {Value: "sample details"}},
+	}
+	cb := slack.InteractionCallback{
+		User: slack.User{ID: "UAAA"},
+		View: slack.View{State: &slack.ViewState{Values: values}},
+	}
+	rec := httptest.NewRecorder()
+
+	// Act
+	h.handlePayFormSubmission(rec, cb)
+
+	// Assert
+	var response struct {
+		ResponseAction string `json:"response_action"`
+		Errors         map[string]string
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.ResponseAction != "errors" || response.Errors[blockValue] == "" {
+		t.Fatalf("modal response: %+v", response)
+	}
+}
+
+func TestPaymentFormMissingStateReturnsFieldErrors(t *testing.T) {
+	// Arrange
+	h, _, _ := newHandler(t)
+	rec := httptest.NewRecorder()
+	cb := slack.InteractionCallback{User: slack.User{ID: "UAAA"}}
+
+	// Act
+	h.handlePayFormSubmission(rec, cb)
+
+	// Assert
+	var response struct{ Errors map[string]string }
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Errors[blockMethod] == "" || response.Errors[blockValue] == "" {
+		t.Fatalf("missing field errors: %+v", response)
+	}
+}
+
+func TestMissingPaymentMethodGetsFailureReaction(t *testing.T) {
+	// Arrange
+	h, sp, _ := newHandler(t)
+	event := parseCallbackEvent(t, appMention("<@USERGEANT> pay set-default bank"))
+
+	// Act
+	dispatch(t, h, event)
+
+	// Assert
+	var verdict []string
+	for _, r := range sp.reactions {
+		if r.name != mentionEmoji {
+			verdict = append(verdict, r.name)
+		}
+	}
+	if !slices.Equal(verdict, []string{failureEmoji}) {
+		t.Fatalf("reactions for declined change: %v", sp.reactions)
+	}
+}
+
+func TestSlackUsesLegacyWhileGhostIsOffline(t *testing.T) {
+	// Arrange
+	h, sp, accounts := newHandler(t)
+	body := appMention("<@USERGEANT> <@UBBB> +20\n<@UCCC> +10")
+
+	// Act
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, sign(t, body, time.Now().Unix()))
+	h.Wait()
+
+	// Assert
+	if response.Code != http.StatusOK || len(sp.reactions) != 2 || len(sp.calls) != 0 {
+		t.Fatalf("legacy response HTTP %d, reactions %+v, posts %+v", response.Code, sp.reactions, sp.calls)
+	}
+	status, err := accounts.ApplyOnce(t.Context(), "query", "UAAA", parser.Command{Kind: parser.KindStatusFor, Target: "UBBB"})
+	if err != nil || status.Text != "<@UBBB> owes you 20.00 PLN." {
+		t.Fatalf("status %+v, err %v", status, err)
+	}
+	first, ok, err := accounts.Next(t.Context())
+	if err != nil || !ok || first.Command.Target != "UBBB" || first.Command.Minor != 2000 {
+		t.Fatalf("queued first line %+v, err %v", first, err)
 	}
 }

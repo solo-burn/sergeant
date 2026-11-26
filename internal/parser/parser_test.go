@@ -2,6 +2,7 @@ package parser
 
 import (
 	"errors"
+	"math"
 	"slices"
 	"testing"
 )
@@ -64,6 +65,7 @@ func TestParseMessageRejectsInvalidBatch(t *testing.T) {
 		{name: "empty message", text: "\n \n"},
 		{name: "invalid later amount", text: "<@U1> +39\n<@U2> +oops"},
 		{name: "invalid later currency", text: "<@U1> +39\n<@U2> +41 PLNS"},
+		{name: "currency on its own line", text: "<@U1> +39\nEUR"},
 		{name: "query mixed with adjustment", text: "<@U1> +39\nstatus"},
 		{name: "reset mixed with adjustment", text: "<@U1> +39\n<@U2> reset"},
 		{name: "multiple entries on one line", text: "<@U1> +39 <@U2> +41"},
@@ -81,6 +83,32 @@ func TestParseMessageRejectsInvalidBatch(t *testing.T) {
 				t.Fatalf("got %+v, %v; want no commands and ErrUnrecognized", got, err)
 			}
 		})
+	}
+}
+
+func TestParseRejectsOneCentAboveMaximum(t *testing.T) {
+	// Arrange
+	text := "<@U1> +92233720368547758.08 PLN"
+
+	// Act
+	_, err := Parse(text)
+
+	// Assert
+	if !errors.Is(err, ErrUnrecognized) {
+		t.Fatalf("expected ErrUnrecognized, got %v", err)
+	}
+}
+
+func TestParseAcceptsLargestAmountInCents(t *testing.T) {
+	// Arrange
+	text := "<@U1> +092233720368547758.07 PLN"
+
+	// Act
+	cmd, err := Parse(text)
+
+	// Assert
+	if err != nil || cmd.Minor != math.MaxInt64 {
+		t.Fatalf("parsed %d cents, want %d (err %v)", cmd.Minor, int64(math.MaxInt64), err)
 	}
 }
 
@@ -148,13 +176,21 @@ func TestParse(t *testing.T) {
 		{in: "?", want: Command{Kind: KindStatusAll}},
 		{in: "  ?  ", want: Command{Kind: KindStatusAll}},
 		{in: "  STATUS  ", want: Command{Kind: KindStatusAll}},
-		{in: "  <@U1>   +20   PLN  ", want: Command{Kind: KindAdd, Target: "U1", Sign: 1, Minor: 2000, Currency: "PLN"}},
+		{
+			in:   "  <@U1>   +20   PLN  ",
+			want: Command{Kind: KindAdd, Target: "U1", Sign: 1, Minor: 2000, Currency: "PLN"},
+		},
 
-		// Payment-method forms.
 		{in: "pay me", want: Command{Kind: KindPayShowSelf}},
 		{in: "  PAY  ME  ", want: Command{Kind: KindPayShowSelf}},
-		{in: "pay set bank PL61 1090 0000 1234 5678", want: Command{Kind: KindPaySet, PayMethod: "bank", PayValue: "PL61 1090 0000 1234 5678"}},
-		{in: "pay set BLIK 555 555 555", want: Command{Kind: KindPaySet, PayMethod: "blik", PayValue: "555 555 555"}},
+		{
+			in:   "pay set bank PL61 1090 0000 1234 5678",
+			want: Command{Kind: KindPaySet, PayMethod: "bank", PayValue: "PL61 1090 0000 1234 5678"},
+		},
+		{
+			in:   "pay set BLIK 555 555 555",
+			want: Command{Kind: KindPaySet, PayMethod: "blik", PayValue: "555 555 555"},
+		},
 		{in: "pay set-default bank", want: Command{Kind: KindPaySetDefault, PayMethod: "bank"}},
 		{in: "pay set-default BLIK", want: Command{Kind: KindPaySetDefault, PayMethod: "blik"}},
 		{in: "pay rm bank", want: Command{Kind: KindPayRemove, PayMethod: "bank"}},
@@ -173,23 +209,23 @@ func TestParse(t *testing.T) {
 		{in: "  HELLO  ", want: Command{Kind: KindHello}},
 
 		{in: "", bad: true},
-		{in: "<@U1> +abc", bad: true},      // bad amount
-		{in: "<@U1> +20 PLNS", bad: true},  // bad currency
-		{in: "<@U1> +20.123", bad: true},   // too many fraction digits
-		{in: "<@U1> +20,123", bad: true},   // too many fraction digits (comma)
-		{in: "<@U1> +20,", bad: true},      // trailing comma
-		{in: "<@U1> +20.", bad: true},      // trailing dot
-		{in: "<@U1> +1,2,3", bad: true},    // multiple separators
-		{in: "<@U1> pay 20", bad: true},    // pay takes no args after target
-		{in: "pay set bank", bad: true},    // missing value
-		{in: "pay set-default", bad: true}, // missing method
+		{in: "<@U1> +abc", bad: true},
+		{in: "<@U1> +20 PLNS", bad: true},
+		{in: "<@U1> +20.123", bad: true}, // too many fraction digits
+		{in: "<@U1> +20,123", bad: true},
+		{in: "<@U1> +20,", bad: true},
+		{in: "<@U1> +20.", bad: true},
+		{in: "<@U1> +1,2,3", bad: true},
+		{in: "<@U1> pay 20", bad: true}, // pay takes no args after target
+		{in: "pay set bank", bad: true},
+		{in: "pay set-default", bad: true},
 		{in: "pay set-default a b", bad: true},
 		{in: "pay set-default BAD!", bad: true},
-		{in: "pay set BAD! value", bad: true}, // invalid method chars
+		{in: "pay set BAD! value", bad: true},
 		{in: "pay rm", bad: true},
 		{in: "pay clear extra", bad: true},
 		{in: "pay nonsense", bad: true},
-		{in: "pay", bad: true}, // bare pay no longer recognized
+		{in: "pay", bad: true},
 		{in: "pay me extra", bad: true},
 		{in: "<@U1> status now", bad: true},
 		{in: "<@U1> reset PLN extra", bad: true},

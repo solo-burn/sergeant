@@ -6,85 +6,28 @@
 
 A Slack bot that tracks who owes you money.
 
-## Talking to the bot
+## Usage
 
-```
-@sergeant @jan +20 PLN     jan now owes you 20 PLN
-@sergeant @jan 20 PLN      plus is optional!
-@sergeant @jan -5          knocks 5 off his tab (default currency)
-@sergeant @jan reset       clears his tab with you
-@sergeant @jan status      shows what he owes you (or @sergeant @jan ?)
-@sergeant status           shows everyone's tab with you (or @sergeant ?)
-@sergeant summary          posts who owes you and your payment methods
-
-@sergeant pay set          opens a private form to add a payment method
-@sergeant pay set bank PL61 1090 ...   same, but typed inline
-@sergeant pay set-default bank         marks a saved method as your default
-@sergeant pay me           shows your own payment methods (or @sergeant payme)
-@sergeant @jan pay         shows jan's payment methods
-@sergeant pay rm bank      removes one method
-@sergeant pay clear        wipes all your methods
-
-@sergeant help             shows the help message (private to you)
-@sergeant hello            posts the help message to the channel
+```text
+@sergeant @jan +20 PLN   Add 20 PLN to Jan's tab
+@sergeant @jan -5 PLN    Subtract 5 PLN
+@sergeant @jan reset     Clear your tab with Jan
+@sergeant status         Show your balances
+@sergeant pay set        Save a payment method
+@sergeant help           Show all commands
 ```
 
-To adjust several people's tabs in one message, put each person and amount on a separate line:
+For batch updates, put each person and amount on a separate line. In a DM, omit `@sergeant`. Status and payment replies appear where you ask.
 
-```
-@sergeant
-@user1 +39
-@user2 +41
-@user3 +43
-```
+## Setup
 
-Every successful command gets a `:white_check_mark:` reaction. Successful debt changes use reactions only, including in DMs: `:sergeant:` plus `:white_check_mark:`. Failures get `:sergeant-no:`, with the failure list for multiline updates described above. Status and pay replies are private to you.
+1. Give the Slack bot the `app_mentions:read`, `chat:write`, `chat:write.public`, `im:history`, and `reactions:write` scopes.
+2. Subscribe to `app_mention` and `message.im`. Point Event Subscriptions and Interactivity at `https://your-host/slack/events`.
+3. Copy [.env.example](.env.example) to `.env` and fill in `SLACK_BOT_TOKEN` and `SLACK_SIGNING_SECRET`.
+4. Run `direnv allow` to load the Nix environment and `.env`, then `make run`. The default port is `8080`.
 
-You can also DM the bot directly - drop the `@sergeant` prefix and just type the command (e.g. `@jan +20 PLN`).
+Run `make check` for formatting, vet, lint, and tests.
 
-## Running it
-
-For dev:
-
-```sh
-cp .env.example .env        # then fill in SLACK_BOT_TOKEN / SLACK_SIGNING_SECRET
-nix develop                 # or `direnv allow` if you use direnv (auto-loads .env)
-make run
-```
-
-One-shot run from the flake:
-
-```sh
-SLACK_BOT_TOKEN=xoxb-... SLACK_SIGNING_SECRET=... nix run
-# PL:
-SLACK_BOT_TOKEN=xoxb-... SLACK_SIGNING_SECRET=... nix run .#sergeant-pl
-```
-
-It listens on `:8080` and expects Slack events at `/slack/events`. For local dev, point `ngrok http 8080` at it.
-
-## Slack setup
-
-In your Slack app:
-
-- OAuth scopes: `app_mentions:read`, `chat:write`, `chat:write.public`, `im:history` (for DMs).
-- Event Subscriptions: enable, request URL `https://your-host/slack/events`, subscribe to `app_mention` and `message.im`.
-- Interactivity & Shortcuts: enable, request URL `https://your-host/slack/events`.
-
-## Env vars
-
-- `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` - required
-- `SERGEANT_DB_PATH` - defaults to `./sergeant.db`
-- `SERGEANT_HTTP_ADDR` - defaults to `:8080`
-- `SERGEANT_DEFAULT_CURRENCY` - defaults to `PLN`
-- `SERGEANT_LOCALE` - `en` or `pl`, defaults to `en`
-
-## Tests / Linting / Whatever
-
-From inside `nix develop`:
-
-```sh
-make check        # fmt + vet + lint + test
-make test         # just tests
-```
-
-`nix flake check` runs the release build (with tests) and verifies `flake.nix` formatting.
+The bot starts the read-only ledger dashboard on `0.0.0.0:8081`. Open `http://<bot-host>:8081/` to browse `SERGEANT_LEDGER_DB_PATH`. To run the dashboard alone, use `go run ./cmd/sergeant ledger`.
+The live view updates in place every two seconds. Browse older entries in pages of 32.
+The header counts every journal entry. PLN and EUR turnover sum adjustments and resets once each, excluding opening balances.

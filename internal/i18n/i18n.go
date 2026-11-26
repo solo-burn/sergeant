@@ -8,34 +8,35 @@ import (
 const DefaultLocale = "en"
 
 const (
-	LedgerNowOwes             = "ledger.now_owes"               // args: target, amount, currency
-	LedgerYouOwe              = "ledger.you_owe"                // args: target, amount, currency
-	LedgerTabCleared          = "ledger.tab_cleared"            // args: target, currency
-	LedgerResetAll            = "ledger.reset_all"              // args: target
-	LedgerResetCurrency       = "ledger.reset_currency"         // args: target, currency
-	LedgerStatusForEmpty      = "ledger.status_for_empty"       // args: target
-	LedgerStatusFor           = "ledger.status_for"             // args: target, joined amounts
-	LedgerStatusAllEmpty      = "ledger.status_all_empty"       //
-	LedgerStatusAllOwedHeader = "ledger.status_all_owed_header" //
-	LedgerStatusAllOweHeader  = "ledger.status_all_owe_header"  //
-	LedgerStatusAllLine       = "ledger.status_all_line"        // args: target, joined amounts
+	DashboardMetrics = "dashboard.metrics"
 
-	LedgerSummaryOwedHeader = "ledger.summary_owed_header" // Who owes you money:
-	LedgerSummaryPayHeader  = "ledger.summary_pay_header"  // Pay here:
-	LedgerSummaryEmpty      = "ledger.summary_empty"       // Nobody owes you anything.
+	LedgerNowOwes             = "ledger.now_owes"         // args: target, amount, currency
+	LedgerYouOwe              = "ledger.you_owe"          // args: target, amount, currency
+	LedgerTabCleared          = "ledger.tab_cleared"      // args: target, currency
+	LedgerResetAll            = "ledger.reset_all"        // args: target
+	LedgerResetCurrency       = "ledger.reset_currency"   // args: target, currency
+	LedgerStatusForEmpty      = "ledger.status_for_empty" // args: target
+	LedgerStatusFor           = "ledger.status_for"       // args: target, joined amounts
+	LedgerStatusAllEmpty      = "ledger.status_all_empty"
+	LedgerStatusAllOwedHeader = "ledger.status_all_owed_header"
+	LedgerStatusAllOweHeader  = "ledger.status_all_owe_header"
+	LedgerStatusAllLine       = "ledger.status_all_line" // args: target, joined amounts
 
-	PaySaved          = "pay.saved"           // args: method
-	PayRemoved        = "pay.removed"         // args: method
-	PayCleared        = "pay.cleared"         //
+	LedgerSummaryOwedHeader = "ledger.summary_owed_header"
+	LedgerSummaryPayHeader  = "ledger.summary_pay_header"
+	LedgerSummaryEmpty      = "ledger.summary_empty"
+
+	PaySaved          = "pay.saved"   // args: method
+	PayRemoved        = "pay.removed" // args: method
+	PayCleared        = "pay.cleared"
 	PayDefaultSet     = "pay.default_set"     // args: method
 	PayDefaultMissing = "pay.default_missing" // args: method
-	PayShowSelfEmpty  = "pay.show_self_empty" //
-	PayShowForEmpty   = "pay.show_for_empty"  // args: target
+	PayShowSelfEmpty  = "pay.show_self_empty"
+	PayShowForEmpty   = "pay.show_for_empty" // args: target
 
 	PayLine        = "pay.line"         // args: method, value
 	PayLineDefault = "pay.line_default" // args: method, value
 
-	// Modal flow:
 	PayOpenerText   = "pay.opener_text"
 	PayOpenerButton = "pay.opener_button"
 	PayModalTitle   = "pay.modal_title"
@@ -52,7 +53,6 @@ const (
 	PayOptWise      = "pay.option_wise"
 
 	HandlerUsage         = "handler.usage"
-	HandlerSelfTarget    = "handler.self_target"
 	HandlerError         = "handler.error"
 	HandlerFailedUpdates = "handler.failed_updates" // args: failed update list
 	HandlerFailedUpdate  = "handler.failed_update"  // args: target, update number
@@ -60,6 +60,7 @@ const (
 
 var bundles = map[string]map[string]string{
 	"en": {
+		DashboardMetrics:          "events %d, moved PLN %s EUR %s",
 		LedgerNowOwes:             "<@%s> now owes you %s %s.",
 		LedgerYouOwe:              "You now owe <@%s> %s %s.",
 		LedgerTabCleared:          "Tab cleared: <@%s> owes you nothing in %s.",
@@ -121,12 +122,12 @@ var bundles = map[string]map[string]string{
 			"- `@sergeant <@user> pay` - show someone else's methods\n\n" +
 			"*Other*\n" +
 			"- `@sergeant help` - ??? you are already seeing it!",
-		HandlerSelfTarget:    "You can't owe yourself.",
 		HandlerError:         "Something went wrong.",
 		HandlerFailedUpdates: "These updates failed; all other updates were saved:\n%s",
 		HandlerFailedUpdate:  "- <@%s> (update %d)",
 	},
 	"pl": {
+		DashboardMetrics:          "zdarzenia %d, obrot PLN %s EUR %s",
 		LedgerNowOwes:             "<@%s> jest tobie winny %s %s.",
 		LedgerYouOwe:              "Jesteś winny <@%s> %s %s.",
 		LedgerTabCleared:          "Wyzerowano: <@%s> nie ma u Ciebie długu w %s.",
@@ -188,7 +189,6 @@ var bundles = map[string]map[string]string{
 			"- `@sergeant <@user> pay` - pokaż metody innej osoby\n\n" +
 			"*Pozostałe*\n" +
 			"- `@sergeant help` - ??? to co wlasnie widzisz!",
-		HandlerSelfTarget:    "Nie możesz zapisać długu na samego siebie.",
 		HandlerError:         "Coś poszło nie tak.",
 		HandlerFailedUpdates: "Te zmiany się nie powiodły; wszystkie pozostałe zostały zapisane:\n%s",
 		HandlerFailedUpdate:  "- <@%s> (zmiana %d)",

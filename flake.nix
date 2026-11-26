@@ -27,7 +27,7 @@
                 && !(pkgs.lib.hasPrefix "result" base);
           };
 
-          vendorHash = "sha256-H1IzQHCiCteOuWWHUEUiBMqtluXzoSF+Bmp8EUH8yE8=";
+          vendorHash = "sha256-2/s9TlGwi5eVAgNWvNqiw0HU3wIIsyxdANFtQL65Zh8=";
 
           subPackages = [ "cmd/sergeant" ];
           ldflags = [ "-s" "-w" ];

@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sergeant</title>
+<style>
+  :root { color-scheme: light dark; color: light-dark(black, white); }
+  body { margin: 16px; font: .875rem/1.5 Menlo, monospace; }
+  #metrics { margin: 0 0 .6rem; font: inherit; font-size: .75rem; }
+  #metrics:empty { display: none; }
+  table { border-spacing: 0; font: inherit; }
+  td { padding: 0 2ch 0 0; white-space: pre; }
+  nav { margin-top: 1rem; }
+  nav a { color: inherit; }
+  @keyframes blink { 50% { opacity: 0; } }
+  @media (prefers-reduced-motion: no-preference) {
+    .cursor { animation: blink 1s step-end infinite; }
+  }
+</style>
+<main>
+  <pre id="metrics">{{.Metrics}}</pre>
+  <div id="prompt" {{if .Entries}}hidden{{end}}>$<span class="cursor">_</span></div>
+  <table><tbody id="entries">{{template "rows" .Entries}}</tbody></table>
+  <nav>
+    {{if .Newer}}<a href="/?after={{.Newer}}" rel="prev" aria-label="Newer entries">←</a>{{end}}
+    {{if not .Live}}<a href="/" aria-label="Live entries">↺</a>{{end}}
+    <a id="older" rel="next" aria-label="Older entries" {{if .Older}}href="/?before={{.Older}}"{{else}}hidden{{end}}>→</a>
+  </nav>
+</main>
+{{if .Live}}<script>
+  const metrics = document.getElementById("metrics");
+  const entries = document.getElementById("entries");
+  const prompt = document.getElementById("prompt");
+  const older = document.getElementById("older");
+
+  async function update() {
+    try {
+      if (document.hidden) return;
+      const newest = entries.firstElementChild?.dataset.id || "0";
+      const response = await fetch("/entries?since=" + newest);
+      const totals = response.headers.get("X-Ledger-Metrics");
+      if (totals !== null) metrics.textContent = totals;
+      if (response.status === 204) return;
+      if (response.status === 503) {
+        metrics.textContent = "";
+        entries.replaceChildren();
+        prompt.hidden = false;
+        older.hidden = true;
+        return;
+      }
+      if (!response.ok) return;
+      entries.insertAdjacentHTML("afterbegin", await response.text());
+      prompt.hidden = true;
+      if (entries.rows.length > {{.Limit}} || response.headers.has("X-Ledger-Has-Older")) {
+        while (entries.rows.length > {{.Limit}}) entries.lastElementChild.remove();
+        older.hidden = false;
+      }
+      if (!older.hidden) older.href = "/?before=" + entries.lastElementChild.dataset.id;
+    } catch {
+      // The next poll retries a dropped connection.
+    } finally {
+      setTimeout(update, 2000);
+    }
+  }
+  setTimeout(update, 2000);
+</script>{{end}}
+</html>
+{{define "rows"}}{{range .}}<tr data-id="{{.ID}}"><td>{{.ID}}</td><td>{{.RecordedAt}}</td><td>{{.Kind}}</td><td>{{.Creditor}}</td><td>{{.Debtor}}</td><td>{{.Currency}}</td><td>{{.Amount}}</td><td>{{.Actor}}</td><td>{{.Command}}</td></tr>
+{{end}}{{end}}

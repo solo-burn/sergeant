@@ -3,28 +3,31 @@ package slackapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 
+	"sergeant/internal/engine"
 	"sergeant/internal/i18n"
-	"sergeant/internal/ledger"
 	"sergeant/internal/parser"
 )
 
 const (
-	maxBodyBytes             = 1 << 20
-	replyTimeout             = 5 * time.Second
-	mentionEmoji             = "sergeant"
-	unrecognizedCommandEmoji = "sergeant-no"
-	successEmoji             = "white_check_mark"
+	maxBodyBytes = 1 << 20
+	replyTimeout = 5 * time.Second
+	mentionEmoji = "sergeant"
+	failureEmoji = "sergeant-no"
+	successEmoji = "white_check_mark"
 )
 
 type Responder interface {
@@ -54,7 +57,9 @@ func (r SlackResponder) PostEphemeral(ctx context.Context, channel, user, text s
 	return err
 }
 
-func (r SlackResponder) PostEphemeralBlocks(ctx context.Context, channel, user, fallback string, blocks []slack.Block) error {
+func (r SlackResponder) PostEphemeralBlocks(
+	ctx context.Context, channel, user, fallback string, blocks []slack.Block,
+) error {
 	_, err := r.Client.PostEphemeralContext(ctx, channel, user,
 		slack.MsgOptionText(fallback, false),
 		slack.MsgOptionBlocks(blocks...),
@@ -75,10 +80,11 @@ func (r SlackResponder) AddReaction(ctx context.Context, channel, ts, name strin
 type Handler struct {
 	SigningSecret string
 	BotUserID     string
-	Ledger        *ledger.Ledger
+	Engine        engine.Engine
 	Responder     Responder
 	Translator    *i18n.Translator
 	Logger        *slog.Logger
+	workers       sync.WaitGroup
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -87,8 +93,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
+		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+			http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "read body", http.StatusBadRequest)
 		return
 	}
@@ -101,7 +111,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		err = sv.Ensure()
 	}
 	if err != nil {
-		h.Logger.Warn("verify failed", "err", err)
+		h.Logger.Warn("Slack request verification failed")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -111,6 +121,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The SDK expects event_callback envelopes to contain a non-null event.
+	var envelope struct {
+		Type  string           `json:"type"`
+		Event *json.RawMessage `json:"event"`
+	}
+	err = json.Unmarshal(body, &envelope)
+	if err != nil || (envelope.Type == slackevents.CallbackEvent && envelope.Event == nil) {
+		http.Error(w, "bad event", http.StatusBadRequest)
+		return
+	}
 	event, err := slackevents.ParseEvent(json.RawMessage(body), slackevents.OptionNoVerifyToken())
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -129,8 +149,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(v.Challenge))
 
 	case slackevents.CallbackEvent:
-		w.WriteHeader(http.StatusOK)
-		go h.safely("dispatch", func() { h.dispatch(event) })
+		notice, err := h.processEvent(r.Context(), event)
+		if err != nil {
+			h.Logger.Error("process callback", "err", err)
+			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+		if notice != nil {
+			h.background("reply", func() { h.deliver(notice) })
+		}
 
 	default:
 		h.Logger.Debug("ignoring event", "type", event.Type)
@@ -139,188 +167,192 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type incoming struct {
-	source                      string // "app_mention" or "im"
+	appMention                  bool
 	user, channel, ts, threadTs string
 	text                        string
 }
 
-func (h *Handler) dispatch(event slackevents.EventsAPIEvent) {
+type feedback struct {
+	message     incoming
+	acknowledge bool
+	openForm    bool
+	failed      bool
+	text        string
+	ephemeral   bool
+}
+
+func userMessage(event slackevents.EventsAPIEvent, botUserID string) (incoming, bool) {
 	var msg incoming
 	switch ev := event.InnerEvent.Data.(type) {
 	case *slackevents.AppMentionEvent:
-		msg = incoming{"app_mention", ev.User, ev.Channel, ev.TimeStamp, ev.ThreadTimeStamp, ev.Text}
-	case *slackevents.MessageEvent:
-		// Only direct messages from real users - skip channels, edits/joins,
-		// other bots, and our own outbound messages.
-		if ev.ChannelType != "im" || ev.BotID != "" || ev.SubType != "" || ev.User == "" || ev.User == h.BotUserID {
-			return
+		if ev.BotID != "" || ev.Edited != nil {
+			return incoming{}, false
 		}
-		msg = incoming{"im", ev.User, ev.Channel, ev.TimeStamp, ev.ThreadTimeStamp, ev.Text}
+		msg = incoming{
+			appMention: true,
+			user:       ev.User,
+			channel:    ev.Channel,
+			ts:         ev.TimeStamp,
+			threadTs:   ev.ThreadTimeStamp,
+			text:       ev.Text,
+		}
+	case *slackevents.MessageEvent:
+		if ev.ChannelType != "im" || ev.BotID != "" || ev.SubType != "" {
+			return incoming{}, false
+		}
+		msg = incoming{
+			user:     ev.User,
+			channel:  ev.Channel,
+			ts:       ev.TimeStamp,
+			threadTs: ev.ThreadTimeStamp,
+			text:     ev.Text,
+		}
 	default:
-		h.Logger.Debug("ignoring callback", "inner_type", event.InnerEvent.Type)
-		return
+		return incoming{}, false
+	}
+	if msg.user == "" || msg.user == botUserID || msg.ts == "" || msg.channel == "" {
+		return incoming{}, false
+	}
+	if msg.threadTs == "" {
+		msg.threadTs = msg.ts
+	}
+	return msg, true
+}
+
+func eventReceiptPrefix(event slackevents.EventsAPIEvent, msg incoming) string {
+	if callback, ok := event.Data.(*slackevents.EventsAPICallbackEvent); ok && callback.EventID != "" {
+		return "event/" + callback.EventID
+	}
+	return "msg/" + event.TeamID + "/" + msg.channel + "/" + msg.ts
+}
+
+func (h *Handler) processEvent(parent context.Context, event slackevents.EventsAPIEvent) (*feedback, error) {
+	msg, ok := userMessage(event, h.BotUserID)
+	if !ok {
+		return nil, nil
+	}
+	notice := &feedback{message: msg, acknowledge: msg.appMention}
+	commands, err := parser.ParseMessage(stripBotMention(msg.text, h.BotUserID))
+	if err != nil {
+		notice.failed = true
+		notice.text = h.Translator.T(i18n.HandlerUsage)
+		notice.ephemeral = true
+		return notice, nil
 	}
 
+	ctx, cancel := context.WithTimeout(parent, replyTimeout)
+	defer cancel()
+	receiptPrefix := eventReceiptPrefix(event, msg)
+	first := commands[0]
+	switch first.Kind {
+	case parser.KindAdd, parser.KindReset:
+		// ParseMessage permits multiple commands only for debt adjustments.
+		err := h.applyDebtChanges(ctx, notice, receiptPrefix, commands)
+		return notice, err
+	case parser.KindHelp, parser.KindHello:
+		notice.text = h.Translator.T(i18n.HandlerUsage)
+		notice.ephemeral = first.Kind == parser.KindHelp
+		return notice, nil
+	case parser.KindPaySetForm:
+		notice.openForm = true
+		return notice, nil
+	}
+
+	reply, err := h.Engine.ApplyOnce(ctx, receiptPrefix+"/0", msg.user, first)
+	if err != nil {
+		h.Logger.Error("apply account command", "kind", first.Kind, "target", first.Target, "err", err)
+		notice.failed = true
+		notice.acknowledge = false
+		notice.text = h.Translator.T(i18n.HandlerError)
+		notice.ephemeral = true
+		return notice, err
+	}
+	notice.failed = reply.Declined
+	notice.text = reply.Text
+	return notice, nil
+}
+
+func (h *Handler) applyDebtChanges(
+	ctx context.Context, notice *feedback, receiptPrefix string, commands []parser.Command,
+) error {
+	var failedUpdates []string
+	var retryErr error
+	for index, cmd := range commands {
+		// Preserve the zero-based position in the receipt even when two lines are identical.
+		receiptID := receiptPrefix + "/" + strconv.Itoa(index)
+		_, err := h.Engine.ApplyOnce(ctx, receiptID, notice.message.user, cmd)
+		if err == nil {
+			continue
+		}
+		h.Logger.Error("apply account command", "kind", cmd.Kind, "target", cmd.Target, "err", err)
+		failedUpdates = append(failedUpdates, h.Translator.T(i18n.HandlerFailedUpdate, cmd.Target, index+1))
+		if !errors.Is(err, engine.ErrSelfTarget) && !errors.Is(err, engine.ErrBalanceOverflow) {
+			retryErr = err
+		}
+	}
+
+	if len(failedUpdates) == 0 {
+		notice.acknowledge = true
+		return nil
+	}
+	notice.acknowledge = false
+	notice.failed = true
+	if len(commands) > 1 {
+		notice.text = h.Translator.T(i18n.HandlerFailedUpdates, strings.Join(failedUpdates, "\n"))
+	}
+	return retryErr
+}
+
+func (h *Handler) deliver(notice *feedback) {
 	ctx, cancel := context.WithTimeout(context.Background(), replyTimeout)
 	defer cancel()
-
-	addReaction := func(emoji, logMessage string) {
-		if err := h.Responder.AddReaction(ctx, msg.channel, msg.ts, emoji); err != nil {
-			h.Logger.Warn(logMessage, "err", err)
+	react := func(name string) {
+		if err := h.Responder.AddReaction(ctx, notice.message.channel, notice.message.ts, name); err != nil {
+			h.Logger.Warn("add reaction", "reaction", name, "err", err)
 		}
 	}
-	acknowledge := func(force bool) {
-		if force || msg.source == "app_mention" {
-			addReaction(mentionEmoji, "add reaction")
-		}
+	if notice.acknowledge {
+		react(mentionEmoji)
 	}
-	markSuccess := func(forceAcknowledgement bool) {
-		acknowledge(forceAcknowledgement)
-		addReaction(successEmoji, "add success reaction")
+	if notice.failed {
+		react(failureEmoji)
 	}
-
-	stripped := stripBotMention(msg.text, h.BotUserID)
-	h.Logger.Info(msg.source,
-		"user", msg.user,
-		"channel", msg.channel,
-		"text", stripped,
-	)
-
-	commands, err := parser.ParseMessage(stripped)
-	if err != nil {
-		h.Logger.Info("unrecognized command", "text", stripped)
-		acknowledge(false)
-		addReaction(unrecognizedCommandEmoji, "add reaction")
-		h.send(ctx, Reply{channel: msg.channel, user: msg.user, text: h.Translator.T(i18n.HandlerUsage), ephemeral: true})
-		return
-	}
-	if len(commands) > 1 {
-		var failures []string
-		for i, cmd := range commands {
-			if _, err := h.Ledger.Apply(ctx, msg.user, cmd); err != nil {
-				h.Logger.Error("ledger apply", "target", cmd.Target, "err", err)
-				failures = append(failures, h.Translator.T(i18n.HandlerFailedUpdate, cmd.Target, i+1))
-			}
-		}
-		if len(failures) > 0 {
-			// Report failures even if processing exhausted the original timeout.
-			reportCtx, reportCancel := context.WithTimeout(context.Background(), replyTimeout)
-			defer reportCancel()
-			if err := h.Responder.AddReaction(reportCtx, msg.channel, msg.ts, unrecognizedCommandEmoji); err != nil {
-				h.Logger.Warn("add failed debt mutation reaction", "err", err)
-			}
-			threadTs := msg.threadTs
-			if threadTs == "" {
-				threadTs = msg.ts
-			}
-			h.send(reportCtx, Reply{
-				channel: msg.channel, user: msg.user, threadTs: threadTs,
-				text: h.Translator.T(i18n.HandlerFailedUpdates, strings.Join(failures, "\n")),
-			})
-			return
-		}
-		markSuccess(true)
-		return
-	}
-	cmd := commands[0]
-	h.Logger.Info("dispatch", "kind", cmd.Kind, "target", cmd.Target)
-	debtMutation := cmd.Kind == parser.KindAdd || cmd.Kind == parser.KindReset
-
-	if cmd.Kind == parser.KindHelp {
-		acknowledge(false)
-		if h.send(ctx, Reply{channel: msg.channel, user: msg.user, text: h.Translator.T(i18n.HandlerUsage), ephemeral: true}) {
-			addReaction(successEmoji, "add success reaction")
-		}
-		return
-	}
-
-	if cmd.Kind == parser.KindHello {
-		acknowledge(false)
-		threadTs := msg.threadTs
-		if threadTs == "" {
-			threadTs = msg.ts
-		}
-		if h.send(ctx, Reply{channel: msg.channel, user: msg.user, threadTs: threadTs, text: h.Translator.T(i18n.HandlerUsage)}) {
-			addReaction(successEmoji, "add success reaction")
-		}
-		return
-	}
-
-	if cmd.Kind == parser.KindPaySetForm {
-		acknowledge(false)
-		if err := h.Responder.PostEphemeralBlocks(
-			ctx, msg.channel, msg.user,
-			h.Translator.T(i18n.PayOpenerText),
-			payOpenerBlocks(h.Translator),
-		); err != nil {
-			h.Logger.Error("post pay opener", "err", err)
-		} else {
-			addReaction(successEmoji, "add success reaction")
-		}
-		return
-	}
-
-	r, err := h.Ledger.Apply(ctx, msg.user, cmd)
-	if err != nil {
-		if debtMutation {
-			if err := h.Responder.AddReaction(ctx, msg.channel, msg.ts, unrecognizedCommandEmoji); err != nil {
-				h.Logger.Warn("add failed debt mutation reaction", "err", err)
-			}
-			return
-		}
-		h.Logger.Error("ledger apply", "err", err)
-		h.send(ctx, Reply{channel: msg.channel, user: msg.user, text: h.Translator.T(i18n.HandlerError), ephemeral: true})
-		return
-	}
-
-	if debtMutation {
-		markSuccess(true)
-		return
-	}
-
-	acknowledge(false)
-	threadTs := msg.threadTs
-	if threadTs == "" {
-		threadTs = msg.ts
-	}
-	if h.send(ctx, Reply{
-		channel:   msg.channel,
-		user:      msg.user,
-		threadTs:  threadTs,
-		text:      r.Text,
-		ephemeral: r.Ephemeral,
-	}) {
-		addReaction(successEmoji, "add success reaction")
-	}
-}
-
-type Reply struct {
-	channel, user, threadTs, text string
-	ephemeral                     bool
-}
-
-func (h *Handler) send(ctx context.Context, r Reply) bool {
-	text := ":cop: " + r.text
-	var err error
-	if r.ephemeral {
-		err = h.Responder.PostEphemeral(ctx, r.channel, r.user, text)
-	} else {
-		err = h.Responder.PostInThread(ctx, r.channel, r.threadTs, text)
-	}
-	if err != nil {
+	if err := h.postFeedback(ctx, notice); err != nil {
 		h.Logger.Error("post reply", "err", err)
-		return false
+		return
 	}
-	return true
+	if !notice.failed {
+		react(successEmoji)
+	}
 }
 
-func (h *Handler) safely(label string, fn func()) {
-	defer func() {
-		if r := recover(); r != nil {
-			h.Logger.Error("panic in goroutine", "where", label, "panic", r)
-		}
-	}()
-	fn()
+func (h *Handler) postFeedback(ctx context.Context, notice *feedback) error {
+	msg := notice.message
+	if notice.openForm {
+		fallback := h.Translator.T(i18n.PayOpenerText)
+		return h.Responder.PostEphemeralBlocks(ctx, msg.channel, msg.user, fallback, payOpenerBlocks(h.Translator))
+	}
+	if notice.text == "" {
+		return nil
+	}
+	text := ":cop: " + notice.text
+	if notice.ephemeral {
+		return h.Responder.PostEphemeral(ctx, msg.channel, msg.user, text)
+	}
+	return h.Responder.PostInThread(ctx, msg.channel, msg.threadTs, text)
+}
+
+func (h *Handler) Wait() { h.workers.Wait() }
+
+func (h *Handler) background(label string, fn func()) {
+	h.workers.Go(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				h.Logger.Error("panic in goroutine", "where", label, "panic", r)
+			}
+		}()
+		fn()
+	})
 }
 
 var leadingMentionRE = regexp.MustCompile(`^\s*<@([A-Z0-9]+)(?:\|[^>]*)?>\s*`)
@@ -355,7 +387,7 @@ func (h *Handler) serveInteractivity(w http.ResponseWriter, body []byte) {
 	switch cb.Type {
 	case slack.InteractionTypeBlockActions:
 		w.WriteHeader(http.StatusOK)
-		go h.safely("handleBlockAction", func() { h.handleBlockAction(cb) })
+		h.background("handleBlockAction", func() { h.handleBlockAction(cb) })
 
 	case slack.InteractionTypeViewSubmission:
 		// view_submission must respond synchronously: empty 200 closes the
@@ -376,7 +408,7 @@ func (h *Handler) handleBlockAction(cb slack.InteractionCallback) {
 	defer cancel()
 
 	for _, a := range cb.ActionCallback.BlockActions {
-		if a.ActionID == actionOpenPayForm {
+		if a != nil && a.ActionID == actionOpenPayForm {
 			if err := h.Responder.OpenView(ctx, cb.TriggerID, payModalView(h.Translator)); err != nil {
 				h.Logger.Error("open view", "err", err)
 			}
@@ -386,38 +418,48 @@ func (h *Handler) handleBlockAction(cb slack.InteractionCallback) {
 }
 
 func (h *Handler) handlePayFormSubmission(w http.ResponseWriter, cb slack.InteractionCallback) {
-	values := cb.View.State.Values
+	if cb.User.ID == "" {
+		http.Error(w, "missing user", http.StatusBadRequest)
+		return
+	}
+	var values map[string]map[string]slack.BlockAction
+	if cb.View.State != nil {
+		values = cb.View.State.Values
+	}
 
-	method := values[blockMethod][actionMethod].SelectedOption.Value
+	method, validMethod := parser.NormalizeMethod(values[blockMethod][actionMethod].SelectedOption.Value)
 	value := strings.TrimSpace(values[blockValue][actionValue].Value)
 
-	if method == "" || value == "" {
-		// Re-open the modal with field-level errors.
-		errs := map[string]string{}
-		if method == "" {
-			errs[blockMethod] = h.Translator.T(i18n.PayModalMethod)
-		}
-		if value == "" {
-			errs[blockValue] = h.Translator.T(i18n.PayModalValue)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(slack.NewErrorsViewSubmissionResponse(errs))
+	fieldErrors := map[string]string{}
+	if !validMethod {
+		fieldErrors[blockMethod] = h.Translator.T(i18n.PayModalMethod)
+	}
+	if !parser.ValidPayValue(value) {
+		fieldErrors[blockValue] = h.Translator.T(i18n.PayModalValue)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if len(fieldErrors) != 0 {
+		_ = json.NewEncoder(w).Encode(slack.NewErrorsViewSubmissionResponse(fieldErrors))
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), replyTimeout)
 	defer cancel()
-	if _, err := h.Ledger.Apply(ctx, cb.User.ID, parser.Command{
+	id := ""
+	if cb.View.ID != "" {
+		id = "view/" + cb.View.ID
+	}
+	if _, err := h.Engine.ApplyOnce(ctx, id, cb.User.ID, parser.Command{
 		Kind:      parser.KindPaySet,
 		PayMethod: method,
 		PayValue:  value,
 	}); err != nil {
-		h.Logger.Error("ledger apply (modal)", "err", err)
-		w.WriteHeader(http.StatusOK)
+		h.Logger.Error("save payment method", "err", err)
+		fieldErrors[blockValue] = h.Translator.T(i18n.HandlerError)
+		_ = json.NewEncoder(w).Encode(slack.NewErrorsViewSubmissionResponse(fieldErrors))
 		return
 	}
 
 	saved := paySavedView(h.Translator, method)
-	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(slack.NewUpdateViewSubmissionResponse(&saved))
 }

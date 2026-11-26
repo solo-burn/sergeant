@@ -2,41 +2,49 @@ package parser
 
 import (
 	"errors"
-	"math"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
-type Kind int
+// Kind values are persisted in the shadow command queue.
+type Kind string
 
 const (
-	KindUnknown Kind = iota
-	KindAdd
-	KindReset
-	KindStatusFor
-	KindStatusAll
-	KindPaySet
-	KindPaySetForm
-	KindPaySetDefault
-	KindPayRemove
-	KindPayClear
-	KindPayShowSelf
-	KindPayShowFor
-	KindHelp
-	KindHello
-	KindSummary
+	KindAdd           Kind = "add"
+	KindReset         Kind = "reset"
+	KindStatusFor     Kind = "status_for"
+	KindStatusAll     Kind = "status_all"
+	KindPaySet        Kind = "pay_set"
+	KindPaySetForm    Kind = "pay_set_form"
+	KindPaySetDefault Kind = "pay_set_default"
+	KindPayRemove     Kind = "pay_remove"
+	KindPayClear      Kind = "pay_clear"
+	KindPayShowSelf   Kind = "pay_show_self"
+	KindPayShowFor    Kind = "pay_show_for"
+	KindHelp          Kind = "help"
+	KindHello         Kind = "hello"
+	KindSummary       Kind = "summary"
 )
 
 type Command struct {
-	Kind     Kind
-	Target   string
-	Sign     int   // +1 or -1, set on KindAdd
-	Minor    int64 // amount in 1/100 of major unit, set on KindAdd
-	Currency string
-	// Payment-method commands.
+	Kind      Kind
+	Target    string
+	Sign      int   // +1 or -1, set on KindAdd
+	Minor     int64 // amount in 1/100 of major unit, set on KindAdd
+	Currency  string
 	PayMethod string // e.g. "bank", "blik", "revolut" - lowercase, [a-z0-9-]
 	PayValue  string // free-form, trimmed
+}
+
+func (c Command) Mutates() bool {
+	switch c.Kind {
+	case KindAdd, KindReset, KindPaySet, KindPaySetDefault, KindPayRemove, KindPayClear:
+		return true
+	default:
+		return false
+	}
 }
 
 var ErrUnrecognized = errors.New("unrecognized command")
@@ -48,7 +56,13 @@ var (
 
 // ParseMessage accepts a single command or one debt adjustment per non-empty line.
 func ParseMessage(text string) ([]Command, error) {
-	if cmd, err := Parse(text); err == nil {
+	text = strings.TrimSpace(text)
+	firstLine, _, multiline := strings.Cut(text, "\n")
+	if !multiline || startsInlinePayment(firstLine) {
+		cmd, err := Parse(text)
+		if err != nil {
+			return nil, err
+		}
 		return []Command{cmd}, nil
 	}
 	var commands []Command
@@ -62,10 +76,13 @@ func ParseMessage(text string) ([]Command, error) {
 		}
 		commands = append(commands, cmd)
 	}
-	if len(commands) == 0 {
-		return nil, ErrUnrecognized
-	}
 	return commands, nil
+}
+
+// Inline payment details may wrap onto subsequent lines after the method.
+func startsInlinePayment(line string) bool {
+	fields := strings.Fields(line)
+	return len(fields) >= 3 && strings.EqualFold(fields[0], "pay") && strings.EqualFold(fields[1], "set")
 }
 
 func Parse(text string) (Command, error) {
@@ -86,7 +103,6 @@ func Parse(text string) (Command, error) {
 		return Command{Kind: KindPayShowSelf}, nil
 	}
 
-	// Pay commands without a leading user mention: pay / pay set / pay rm / pay clear.
 	if fields := strings.Fields(text); len(fields) > 0 && strings.EqualFold(fields[0], "pay") {
 		return parsePay(fields)
 	}
@@ -156,12 +172,6 @@ func Parse(text string) (Command, error) {
 	}
 }
 
-// parsePay handles the no-target pay forms:
-//
-//	pay me                       → KindPayShowSelf
-//	pay set <method> <value...>  → KindPaySet
-//	pay rm <method>              → KindPayRemove
-//	pay clear                    → KindPayClear
 func parsePay(fields []string) (Command, error) {
 	if len(fields) == 1 {
 		return Command{}, ErrUnrecognized
@@ -174,18 +184,17 @@ func parsePay(fields []string) (Command, error) {
 		return Command{Kind: KindPayShowSelf}, nil
 	case "set":
 		if len(fields) == 2 {
-			// Bare `pay set` → handler should open the modal.
 			return Command{Kind: KindPaySetForm}, nil
 		}
 		if len(fields) < 4 {
 			return Command{}, ErrUnrecognized
 		}
-		method, ok := normalizeMethod(fields[2])
+		method, ok := NormalizeMethod(fields[2])
 		if !ok {
 			return Command{}, ErrUnrecognized
 		}
-		value := strings.TrimSpace(strings.Join(fields[3:], " "))
-		if value == "" || len(value) > 200 {
+		value := strings.Join(fields[3:], " ")
+		if !ValidPayValue(value) {
 			return Command{}, ErrUnrecognized
 		}
 		return Command{Kind: KindPaySet, PayMethod: method, PayValue: value}, nil
@@ -193,7 +202,7 @@ func parsePay(fields []string) (Command, error) {
 		if len(fields) != 3 {
 			return Command{}, ErrUnrecognized
 		}
-		method, ok := normalizeMethod(fields[2])
+		method, ok := NormalizeMethod(fields[2])
 		if !ok {
 			return Command{}, ErrUnrecognized
 		}
@@ -202,7 +211,7 @@ func parsePay(fields []string) (Command, error) {
 		if len(fields) != 3 {
 			return Command{}, ErrUnrecognized
 		}
-		method, ok := normalizeMethod(fields[2])
+		method, ok := NormalizeMethod(fields[2])
 		if !ok {
 			return Command{}, ErrUnrecognized
 		}
@@ -216,9 +225,14 @@ func parsePay(fields []string) (Command, error) {
 	return Command{}, ErrUnrecognized
 }
 
-// normalizeMethod returns a lowercase method label or false if invalid.
+// ValidPayValue reports whether a trimmed payment value contains 1 to 200 Unicode code points in valid UTF-8.
+func ValidPayValue(value string) bool {
+	return value != "" && utf8.ValidString(value) && utf8.RuneCountInString(value) <= 200
+}
+
+// NormalizeMethod returns a lowercase method label or false if invalid.
 // Allowed: 1-20 chars of [a-z0-9-].
-func normalizeMethod(s string) (string, bool) {
+func NormalizeMethod(s string) (string, bool) {
 	s = strings.ToLower(strings.TrimSpace(s))
 	if len(s) == 0 || len(s) > 20 {
 		return "", false
@@ -244,20 +258,12 @@ func NormalizeCurrency(s string) (string, error) {
 	return s, nil
 }
 
-func parseMinor(intPart, fracPart string) (int64, error) {
-	whole, err := strconv.ParseInt(intPart, 10, 64)
-	if err != nil || whole < 0 || whole > math.MaxInt64/100 {
-		return 0, errors.New("bad amount")
+func parseMinor(whole, fraction string) (int64, error) {
+	switch len(fraction) {
+	case 0:
+		fraction = "00"
+	case 1:
+		fraction += "0"
 	}
-	if fracPart == "" {
-		return whole * 100, nil
-	}
-	frac, err := strconv.ParseInt(fracPart, 10, 64)
-	if err != nil || frac < 0 {
-		return 0, errors.New("bad amount")
-	}
-	if len(fracPart) == 1 {
-		frac *= 10
-	}
-	return whole*100 + frac, nil
+	return strconv.ParseInt(whole+fraction, 10, 64)
 }
