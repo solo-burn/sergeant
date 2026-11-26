@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"sync"
 
 	"github.com/go-jet/jet/v2/sqlite"
 
@@ -56,11 +57,18 @@ func cursorID(query url.Values, key string) (int64, bool) {
 	return id, err == nil && id >= 0
 }
 
-func dashboardHandler(db *sql.DB) http.Handler {
+type ledgerDashboard struct {
+	*http.ServeMux
+	mu   sync.Mutex
+	next chan struct{}
+}
+
+func newDashboard(db *sql.DB) *ledgerDashboard {
 	var totals ledgerTotals
 	tr := i18n.New(os.Getenv("SERGEANT_LOCALE"))
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+	dashboard := &ledgerDashboard{ServeMux: http.NewServeMux()}
+	dashboard.HandleFunc("GET /events", dashboard.serveEvents)
+	dashboard.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
 		before, validBefore := cursorID(query, "before")
 		after, validAfter := cursorID(query, "after")
@@ -96,7 +104,7 @@ func dashboardHandler(db *sql.DB) http.Handler {
 		}
 		_ = dashboardPage.Execute(w, page)
 	})
-	mux.HandleFunc("GET /entries", func(w http.ResponseWriter, r *http.Request) {
+	dashboard.HandleFunc("GET /entries", func(w http.ResponseWriter, r *http.Request) {
 		since, valid := cursorID(r.URL.Query(), "since")
 		if !valid {
 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
@@ -127,10 +135,10 @@ func dashboardHandler(db *sql.DB) http.Handler {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_ = dashboardPage.ExecuteTemplate(w, "rows", entries)
 	})
-	return mux
+	return dashboard
 }
 
-// A newer-page link needs the closest 32 IDs above its cursor. A live poll needs the most recent 32.
+// A newer-page link needs the closest 32 IDs above its cursor. A live update needs the most recent 32.
 func readEntries(
 	ctx context.Context, db *sql.DB, lastID, before, after int64, ascending bool,
 ) ([]ledgerEntry, bool, error) {

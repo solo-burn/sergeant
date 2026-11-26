@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -53,11 +54,16 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	defer func() { _ = db.Close() }()
+	view := newDashboard(db)
+	dashboardCtx, stopDashboard := context.WithCancel(context.Background())
+	defer stopDashboard()
 	dashboard := &http.Server{
+		BaseContext:       func(net.Listener) context.Context { return dashboardCtx },
 		Addr:              getEnv("SERGEANT_DASHBOARD_ADDR", ":8082"),
-		Handler:           dashboardHandler(db),
+		Handler:           view,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	dashboard.RegisterOnShutdown(stopDashboard)
 	botToken := os.Getenv("SLACK_BOT_TOKEN")
 	signingSecret := os.Getenv("SLACK_SIGNING_SECRET")
 	if botToken == "" || signingSecret == "" {
@@ -75,6 +81,7 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	defer func() { _ = trial.Legacy.Close() }()
+	trial.LedgerChanged = view.notifyLedgerChanged
 	replayCtx, stopReplay := context.WithCancel(context.Background())
 	replayDone := make(chan struct{})
 	go func() {

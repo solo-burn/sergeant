@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -11,10 +13,15 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"sergeant/internal/database"
 	"sergeant/internal/database/schema"
+	"sergeant/internal/i18n"
+	"sergeant/internal/parser"
+	"sergeant/internal/shadow"
 )
 
 func dashboardDB(t *testing.T) *sql.DB {
@@ -85,7 +92,7 @@ func TestLivePageShowsOlderLinkOnlyWhenThereIsMoreHistory(t *testing.T) {
 			// Arrange
 			db := dashboardDB(t)
 			seedEntries(t, db, count)
-			handler := dashboardHandler(db)
+			handler := newDashboard(db)
 			res := httptest.NewRecorder()
 
 			// Act
@@ -101,11 +108,71 @@ func TestLivePageShowsOlderLinkOnlyWhenThereIsMoreHistory(t *testing.T) {
 	}
 }
 
-func TestLivePollReturnsOnlyNewEntries(t *testing.T) {
+func startLiveDashboard(t *testing.T) (*shadow.Trial, *httptest.Server) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ledger.db")
+	trial, err := shadow.Open(t.Context(), filepath.Join(dir, "legacy.db"), path, "PLN", i18n.New("en"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = trial.Legacy.Close() })
+	db, err := openDashboardDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	dashboard := newDashboard(db)
+	trial.LedgerChanged = dashboard.notifyLedgerChanged
+	server := httptest.NewServer(dashboard)
+	server.Client().Timeout = 5 * time.Second
+	t.Cleanup(server.Close)
+
+	var replay sync.WaitGroup
+	replay.Go(func() { trial.Run(t.Context(), slog.New(slog.DiscardHandler)) })
+	t.Cleanup(replay.Wait)
+	return trial, server
+}
+
+func TestDashboardStreamsCommittedBalanceChanges(t *testing.T) {
+	// Arrange
+	trial, server := startLiveDashboard(t)
+	stream, err := server.Client().Get(server.URL + "/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.Body.Close() }()
+	lines := bufio.NewScanner(stream.Body)
+	charge := parser.Command{Kind: parser.KindAdd, Target: "B", Sign: 1, Minor: 100}
+
+	// Act
+	_, err = trial.Legacy.ApplyOnce(t.Context(), "charge", "A", charge)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert
+	if got := stream.Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("stream content type = %q", got)
+	}
+	for lines.Scan() {
+		if lines.Text() == "event: ledger-changed" {
+			break
+		}
+	}
+	if !lines.Scan() || !strings.HasPrefix(lines.Text(), "data:") {
+		t.Fatalf("missing ledger-changed event data: %q (stream error: %v)", lines.Text(), lines.Err())
+	}
+	res := httptest.NewRecorder()
+	server.Config.Handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/entries?since=0", nil))
+	checkIDs(t, res.Body.String(), 1, 1)
+}
+
+func TestLiveUpdateReturnsOnlyNewEntries(t *testing.T) {
 	// Arrange
 	db := dashboardDB(t)
 	seedEntries(t, db, 40)
-	handler := dashboardHandler(db)
+	handler := newDashboard(db)
 	res := httptest.NewRecorder()
 
 	// Act
@@ -115,11 +182,11 @@ func TestLivePollReturnsOnlyNewEntries(t *testing.T) {
 	checkIDs(t, res.Body.String(), 40, 39)
 }
 
-func TestLivePollWithNoChangesReturnsNoContent(t *testing.T) {
+func TestLiveUpdateWithNoChangesReturnsNoContent(t *testing.T) {
 	// Arrange
 	db := dashboardDB(t)
 	seedEntries(t, db, 40)
-	handler := dashboardHandler(db)
+	handler := newDashboard(db)
 	res := httptest.NewRecorder()
 
 	// Act
@@ -127,15 +194,15 @@ func TestLivePollWithNoChangesReturnsNoContent(t *testing.T) {
 
 	// Assert
 	if res.Code != http.StatusNoContent || res.Body.Len() != 0 {
-		t.Fatalf("idle poll: %d, %d bytes", res.Code, res.Body.Len())
+		t.Fatalf("idle update: %d, %d bytes", res.Code, res.Body.Len())
 	}
 }
 
-func TestLivePollAfterLongPauseReturnsOnlyNewestPage(t *testing.T) {
+func TestLiveUpdateAfterLongPauseReturnsOnlyNewestPage(t *testing.T) {
 	// Arrange
 	db := dashboardDB(t)
 	seedEntries(t, db, 100)
-	handler := dashboardHandler(db)
+	handler := newDashboard(db)
 	res := httptest.NewRecorder()
 
 	// Act
@@ -162,7 +229,7 @@ func TestHistoryPaginationWhileNewEntriesArrive(t *testing.T) {
 			db := dashboardDB(t)
 			seedEntries(t, db, 65)
 			seedEntries(t, db, 2)
-			handler := dashboardHandler(db)
+			handler := newDashboard(db)
 			res := httptest.NewRecorder()
 
 			// Act
@@ -172,7 +239,7 @@ func TestHistoryPaginationWhileNewEntriesArrive(t *testing.T) {
 			html := res.Body.String()
 			checkIDs(t, html, tc.first, tc.last)
 			if strings.Contains(html, "<script>") {
-				t.Fatal("historical page polls the live feed")
+				t.Fatal("historical page subscribes to the live feed")
 			}
 		})
 	}
@@ -189,7 +256,7 @@ func TestDashboardShowsPromptWhileWaitingForEntries(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// Arrange
-			handler := dashboardHandler(tc.open(t))
+			handler := newDashboard(tc.open(t))
 			res := httptest.NewRecorder()
 
 			// Act
@@ -232,7 +299,7 @@ func TestMetricsCoverWholeLedgerOnHistoricalPage(t *testing.T) {
 	res := httptest.NewRecorder()
 
 	// Act
-	dashboardHandler(db).ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/?before=10", nil))
+	newDashboard(db).ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/?before=10", nil))
 
 	// Assert
 	want := `<pre id="metrics">events 44, moved PLN 49.00 EUR 0.99</pre>`
@@ -250,7 +317,7 @@ func TestLiveMetricsAccumulateNewEntriesBeyondInt64(t *testing.T) {
 	if _, err := db.Exec(insert, "B", int64(math.MaxInt64)); err != nil {
 		t.Fatal(err)
 	}
-	handler := dashboardHandler(db)
+	handler := newDashboard(db)
 	first := httptest.NewRecorder()
 	handler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/", nil))
 	if first.Code != http.StatusOK {

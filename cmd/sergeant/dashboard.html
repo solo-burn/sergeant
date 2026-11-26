@@ -34,35 +34,62 @@
   const older = document.getElementById("older");
 
   async function update() {
+    const newest = entries.firstElementChild?.dataset.id || "0";
+    const response = await fetch("/entries?since=" + newest);
+    const totals = response.headers.get("X-Ledger-Metrics");
+    if (totals !== null) metrics.textContent = totals;
+    if (response.status === 204) return;
+    if (response.status === 503) {
+      metrics.textContent = "";
+      entries.replaceChildren();
+      prompt.hidden = false;
+      older.hidden = true;
+    }
+    if (!response.ok) throw new Error("Ledger update failed");
+    entries.insertAdjacentHTML("afterbegin", await response.text());
+    prompt.hidden = true;
+    if (entries.rows.length > {{.Limit}} || response.headers.has("X-Ledger-Has-Older")) {
+      while (entries.rows.length > {{.Limit}}) entries.lastElementChild.remove();
+      older.hidden = false;
+    }
+    if (!older.hidden) older.href = "/?before=" + entries.lastElementChild.dataset.id;
+  }
+
+  let stream;
+  let updating = false;
+  let pending = false;
+  let retry;
+
+  async function refresh() {
+    clearTimeout(retry);
+    pending = true;
+    if (updating) return;
+    updating = true;
     try {
-      if (document.hidden) return;
-      const newest = entries.firstElementChild?.dataset.id || "0";
-      const response = await fetch("/entries?since=" + newest);
-      const totals = response.headers.get("X-Ledger-Metrics");
-      if (totals !== null) metrics.textContent = totals;
-      if (response.status === 204) return;
-      if (response.status === 503) {
-        metrics.textContent = "";
-        entries.replaceChildren();
-        prompt.hidden = false;
-        older.hidden = true;
-        return;
+      while (pending && !document.hidden) {
+        pending = false;
+        await update();
       }
-      if (!response.ok) return;
-      entries.insertAdjacentHTML("afterbegin", await response.text());
-      prompt.hidden = true;
-      if (entries.rows.length > {{.Limit}} || response.headers.has("X-Ledger-Has-Older")) {
-        while (entries.rows.length > {{.Limit}}) entries.lastElementChild.remove();
-        older.hidden = false;
-      }
-      if (!older.hidden) older.href = "/?before=" + entries.lastElementChild.dataset.id;
     } catch {
-      // The next poll retries a dropped connection.
+      if (!document.hidden) retry = setTimeout(refresh, 2000);
     } finally {
-      setTimeout(update, 2000);
+      updating = false;
     }
   }
-  setTimeout(update, 2000);
+
+  function subscribe() {
+    if (document.hidden) {
+      stream?.close();
+      stream = null;
+      clearTimeout(retry);
+    } else if (!stream) {
+      stream = new EventSource("/events");
+      stream.onopen = refresh;
+      stream.addEventListener("ledger-changed", refresh);
+    }
+  }
+  document.addEventListener("visibilitychange", subscribe);
+  subscribe();
 </script>{{end}}
 </html>
 {{define "rows"}}{{range .}}<tr data-id="{{.ID}}"><td>{{.ID}}</td><td>{{.RecordedAt}}</td><td>{{.Kind}}</td><td>{{.Creditor}}</td><td>{{.Debtor}}</td><td>{{.Currency}}</td><td>{{.Amount}}</td><td>{{.Actor}}</td><td>{{.Command}}</td></tr>

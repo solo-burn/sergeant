@@ -17,10 +17,12 @@ import (
 	"sergeant/internal/ledger"
 	"sergeant/internal/ledger/store"
 	"sergeant/internal/legacy"
+	"sergeant/internal/parser"
 )
 
 type Trial struct {
 	Legacy             *legacy.Engine
+	LedgerChanged      func()
 	id, path, currency string
 	translator         *i18n.Translator
 }
@@ -86,6 +88,9 @@ func (t *Trial) drain(ctx context.Context, ghost replayer) error {
 		}
 		if err = replay(ctx, ghost, d); err != nil {
 			return fmt.Errorf("replay command %d: %w", d.Sequence, err)
+		}
+		if t.LedgerChanged != nil && (d.Command.Kind == parser.KindAdd || d.Command.Kind == parser.KindReset) {
+			t.LedgerChanged()
 		}
 		if err = t.Legacy.Acknowledge(ctx, d.Sequence); err != nil {
 			return err
