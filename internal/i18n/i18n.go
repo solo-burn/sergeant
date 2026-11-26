@@ -127,7 +127,7 @@ var bundles = map[string]map[string]string{
 		HandlerFailedUpdate:  "- <@%s> (update %d)",
 	},
 	"pl": {
-		DashboardMetrics:          "zdarzenia %d, obrot PLN %s EUR %s",
+		DashboardMetrics:          "events %d, moved PLN %s EUR %s",
 		LedgerNowOwes:             "<@%s> jest tobie winny %s %s.",
 		LedgerYouOwe:              "Jesteś winny <@%s> %s %s.",
 		LedgerTabCleared:          "Wyzerowano: <@%s> nie ma u Ciebie długu w %s.",

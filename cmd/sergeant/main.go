@@ -43,31 +43,26 @@ func parseLevel(s string) slog.Level {
 }
 
 func run(logger *slog.Logger) error {
+	if len(os.Args) > 1 {
+		return errors.New("usage: sergeant")
+	}
 	dbPath := getEnv("SERGEANT_DB_PATH", "./sergeant.db")
 	ghostPath := getEnv("SERGEANT_LEDGER_DB_PATH", "./sergeant.ledger.db")
-	ledgerOnly := len(os.Args) == 2 && os.Args[1] == "ledger"
-	if len(os.Args) > 1 && !ledgerOnly {
-		return errors.New("usage: sergeant [ledger]")
-	}
 	db, err := openDashboardDB(ghostPath)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = db.Close() }()
 	dashboard := &http.Server{
-		Addr:              "0.0.0.0:8081",
+		Addr:              ":8082",
 		Handler:           dashboardHandler(db),
 		ReadHeaderTimeout: 5 * time.Second,
-	}
-	if ledgerOnly {
-		return serveHTTP(logger, dashboard)
 	}
 	botToken := os.Getenv("SLACK_BOT_TOKEN")
 	signingSecret := os.Getenv("SLACK_SIGNING_SECRET")
 	if botToken == "" || signingSecret == "" {
 		return errors.New("SLACK_BOT_TOKEN and SLACK_SIGNING_SECRET are required")
 	}
-	addr := getEnv("SERGEANT_HTTP_ADDR", ":8080")
 	defaultCcy, err := parser.NormalizeCurrency(getEnv("SERGEANT_DEFAULT_CURRENCY", "PLN"))
 	if err != nil {
 		return fmt.Errorf("SERGEANT_DEFAULT_CURRENCY: %w", err)
@@ -113,7 +108,7 @@ func run(logger *slog.Logger) error {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {})
 
 	srv := &http.Server{
-		Addr:              addr,
+		Addr:              ":8081",
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,

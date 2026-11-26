@@ -24,10 +24,10 @@ For batch updates, put each person and amount on a separate line. In a DM, omit 
 1. Give the Slack bot the `app_mentions:read`, `chat:write`, `chat:write.public`, `im:history`, and `reactions:write` scopes.
 2. Subscribe to `app_mention` and `message.im`. Point Event Subscriptions and Interactivity at `https://your-host/slack/events`.
 3. Copy [.env.example](.env.example) to `.env` and fill in `SLACK_BOT_TOKEN` and `SLACK_SIGNING_SECRET`.
-4. Run `direnv allow` to load the Nix environment and `.env`, then `make run`. The default port is `8080`.
+4. Run `direnv allow` to load the Nix environment and `.env`, then `make run`. The bot listens on port `8081`.
 
 Run `make check` for formatting, vet, lint, and tests.
 
-The bot starts the read-only ledger dashboard on `0.0.0.0:8081`. Open `http://<bot-host>:8081/` to browse `SERGEANT_LEDGER_DB_PATH`. To run the dashboard alone, use `go run ./cmd/sergeant ledger`.
+The bot serves the read-only ledger dashboard at `http://<bot-host>:8082/`.
 The live view updates in place every two seconds. Browse older entries in pages of 32.
 The header counts every journal entry. PLN and EUR turnover sum adjustments and resets once each, excluding opening balances.
