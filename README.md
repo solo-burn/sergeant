@@ -28,6 +28,6 @@ For batch updates, put each person and amount on a separate line. In a DM, omit 
 
 Run `make check` for formatting, vet, lint, and tests.
 
-The bot serves the read-only ledger dashboard at `http://<bot-host>:8082/`.
+The bot serves the read-only ledger dashboard at `http://<bot-host>:8082/` by default. Set `SERGEANT_DASHBOARD_ADDR` to change its listen address, for example `:9090`. Port `8081` is reserved for the bot.
 The live view updates in place every two seconds. Browse older entries in pages of 32.
 The header counts every journal entry. PLN and EUR turnover sum adjustments and resets once each, excluding opening balances.

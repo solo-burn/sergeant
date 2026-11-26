@@ -54,7 +54,7 @@ func run(logger *slog.Logger) error {
 	}
 	defer func() { _ = db.Close() }()
 	dashboard := &http.Server{
-		Addr:              ":8082",
+		Addr:              getEnv("SERGEANT_DASHBOARD_ADDR", ":8082"),
 		Handler:           dashboardHandler(db),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
